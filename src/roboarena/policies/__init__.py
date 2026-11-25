@@ -21,7 +21,20 @@ def _build_random(spec: TaskSpec, params: Mapping[str, Any], checkpoint: Path | 
     return RandomPolicy(spec, chunk=int(params.get("chunk", 1)), name=name)
 
 
-_BACKENDS: dict[str, PolicyBuilder] = {"random": _build_random}
+def _net_builder(backend: str) -> PolicyBuilder:
+    def build(spec: TaskSpec, params: Mapping[str, Any], checkpoint: Path | None, name: str) -> Policy:
+        from roboarena.policies.nets import build_net_policy  # 用到时才导入 torch
+
+        return build_net_policy(backend, spec, params, checkpoint, name)
+
+    return build
+
+
+_BACKENDS: dict[str, PolicyBuilder] = {
+    "random": _build_random,
+    "bc": _net_builder("bc"),
+    "diffusion": _net_builder("diffusion"),
+}
 
 
 def register_policy_backend(backend: str, builder: PolicyBuilder) -> None:

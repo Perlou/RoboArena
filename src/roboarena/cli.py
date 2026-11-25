@@ -14,14 +14,16 @@ from roboarena.core.errors import RoboArenaError
 from roboarena.core.log import setup_logging
 from roboarena.data.dataset import build_dataset, load_dataset, render_report, verify_dataset
 from roboarena.eval import service
+from roboarena.eval.rollouts import collect_rollouts
 from roboarena.policies import list_policy_backends
-from roboarena.store.registry import list_artifacts, register_artifact
+from roboarena.policies.train import train_policy
+from roboarena.policies.zoo import build_zoo
+from roboarena.store.registry import delete_artifact, list_artifacts, register_artifact
 from roboarena.store.workspace import Workspace
 from roboarena.tasks import get_task, list_tasks
 
 # 还没实现的命令 → 计划在哪个里程碑完成
 PLANNED = {
-    "train": "M2（策略）与 M3（世界模型）",
     "report": "M4",
     "pipeline": "M4",
     "bench": "M5a",
@@ -110,6 +112,43 @@ def cmd_data_verify(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_train_policy(cfg: Config, args: argparse.Namespace) -> int:
+    if args.resume is None and args.name is None:
+        raise RoboArenaError("需要 --name（新训练）或 --resume <运行编号>（续训）")
+    with Workspace(cfg.workspace.root) as ws:
+        artifact = train_policy(ws, cfg, args.name or "", backend=args.backend, resume=args.resume)
+    print(
+        f"已训练并登记策略 {artifact.name}：{artifact.params['n_demos']} 条演示，{artifact.params['steps']} 步"
+    )
+    return 0
+
+
+def cmd_train_zoo(cfg: Config, args: argparse.Namespace) -> int:
+    with Workspace(cfg.workspace.root) as ws:
+        names, created = build_zoo(ws, cfg)
+    print(f"策略库共 {len(names)} 个策略，这次新增 {len(created)} 个：{'、'.join(created) or '无'}")
+    return 0
+
+
+def cmd_data_rollouts(cfg: Config, args: argparse.Namespace) -> int:
+    with Workspace(cfg.workspace.root) as ws:
+        summary = collect_rollouts(ws, cfg)
+    rows = [(name, n, k, frames) for name, (n, k, frames) in summary.per_policy.items()]
+    print(_table(("策略", "回合", "成功", "帧"), rows))
+    print(f"已保存策略回合集 {cfg.rollouts.name}：{summary.dir}")
+    print(
+        f"并入数据集：roboarena data build --set data.name=<新名称> --set 'data.rollouts=[\"{cfg.rollouts.name}\"]'"
+    )
+    return 0
+
+
+def cmd_policy_remove(cfg: Config, args: argparse.Namespace) -> int:
+    with Workspace(cfg.workspace.root) as ws:
+        n_evals = delete_artifact(ws, args.name)
+    print(f"已删除策略 {args.name} 和它的 {n_evals} 次评测结果")
+    return 0
+
+
 def cmd_policy_add(cfg: Config, args: argparse.Namespace) -> int:
     params = json.loads(args.params)
     if not isinstance(params, dict):
@@ -133,7 +172,14 @@ def cmd_policy_list(cfg: Config, args: argparse.Namespace) -> int:
 
 def cmd_eval_run(cfg: Config, args: argparse.Namespace) -> int:
     with Workspace(cfg.workspace.root) as ws:
-        for name in args.policy:
+        names = args.policy or []
+        if args.all:
+            names = [
+                a.name for a in list_artifacts(ws, task=get_task(cfg.task.name).spec.name, kind="policy")
+            ]
+        if not names:
+            raise RoboArenaError("需要 --policy <名称…> 或 --all")
+        for name in names:
             out = service.run_eval(ws, cfg, name, args.sim, force=args.force)
             note = "（库里已有结果，未重跑）" if out.skipped else ""
             print(f"{out.policy} @ {out.sim}：{out.successes}/{out.n} 成功{note}")
@@ -211,7 +257,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="数据集已存在时删掉重建")
     leaf(data, "info", "显示数据集的校验报告", cmd_data_info)
     leaf(data, "verify", "重新读取全部回合文件，核对指纹并重跑检查", cmd_data_verify)
+    leaf(data, "rollouts", "让已登记的策略在真实仿真器里跑，记录成可并入数据集的回合", cmd_data_rollouts)
     leaf(data, "suite", "按配置生成评测集（一组固定的初始状态）", cmd_data_suite)
+
+    train = group("train", "训练")
+    p = leaf(train, "policy", "训练一个策略并登记", cmd_train_policy)
+    p.add_argument(
+        "--backend",
+        default="bc",
+        choices=["bc", "diffusion"],
+        help="bc 读 [policy] 段，diffusion 读 [diffusion] 段",
+    )
+    p.add_argument("--name", help="登记的名称")
+    p.add_argument("--resume", metavar="运行编号", help="从这次运行的最后一个检查点接着训练")
+
+    leaf(train, "zoo", "训练并登记整个策略库（已有的跳过）", cmd_train_zoo)
 
     policy = group("policy", "策略注册表")
     p = leaf(policy, "add", "登记一个不需要训练的策略", cmd_policy_add)
@@ -219,10 +279,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--backend", required=True, choices=list_policy_backends())
     p.add_argument("--params", default="{}", help="构造参数，JSON 对象，如 '{\"chunk\": 4}'")
     leaf(policy, "list", "列出已登记的策略", cmd_policy_list)
+    p = leaf(policy, "remove", "删除一个策略和它的评测结果", cmd_policy_remove)
+    p.add_argument("--name", required=True)
 
     ev = group("eval", "评测")
     p = leaf(ev, "run", "在指定仿真器上评测一个或多个策略", cmd_eval_run)
-    p.add_argument("--policy", nargs="+", required=True, metavar="名称")
+    p.add_argument("--policy", nargs="+", metavar="名称")
+    p.add_argument("--all", action="store_true", help="评测当前任务的全部策略")
     p.add_argument("--sim", default=service.REAL, help="real，或某个世界模型的名称（M3 起）")
     p.add_argument("--force", action="store_true", help="已有结果时删掉重跑")
     p = leaf(ev, "leaderboard", "排行榜：成功率与 Wilson 区间", cmd_eval_leaderboard)

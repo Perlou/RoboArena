@@ -2,6 +2,21 @@
 [task]
 name = "pusht"
 
+[policy]
+steps = 20000
+snapshots = [500, 1000, 2000, 5000, 10000]
+
+[diffusion]
+steps = 20000
+snapshots = [5000, 10000]
+
+[zoo]
+diffusion = true
+base = "bc"
+n_demos = [10, 25, 50, 100]
+exec_noise = [0.02, 0.05, 0.1]
+
 [eval]
 n_inits = 50
 batch = 16
+n_exec = 4

@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from roboarena.core.errors import ConflictError, NotFoundError
 from roboarena.core.hashing import canonical_json, sha256_file, sha256_text
 from roboarena.core.log import add_log_file, remove_log_file
 from roboarena.store.db import now
@@ -147,6 +148,39 @@ def start_run(
         run._finish("done")
     finally:
         remove_log_file(handler)
+
+
+@contextmanager
+def resume_run(ws: Workspace, run_id: str) -> Iterator[Run]:
+    """接着一次没跑完的运行继续：沿用它的目录和记录，状态改回 running。"""
+    row = ws.db.execute("SELECT kind, status FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        raise NotFoundError(f"没有编号为 {run_id} 的运行")
+    if row["status"] == "done":
+        raise ConflictError(f"运行 {run_id} 已经完成，不需要续跑")
+    run = Run(run_id, row["kind"], ws.root / "runs" / run_id, ws)
+    ws.db.execute("UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (run_id,))
+    ws.db.commit()
+    run.update_meta(status="running", finished_at=None, resumed_at=now())
+    handler = add_log_file(run.dir / "log.txt")
+    try:
+        yield run
+    except KeyboardInterrupt:
+        run._finish("interrupted")
+        raise
+    except BaseException:
+        run._finish("failed")
+        raise
+    else:
+        run._finish("done")
+    finally:
+        remove_log_file(handler)
+
+
+def truncate_metrics(run_dir: Path, max_step: int) -> None:
+    """丢掉步数大于 max_step 的指标。续训从检查点的步数重新开始，之后的记录会重新产生。"""
+    kept = [m for m in read_metrics(run_dir) if m["step"] <= max_step]
+    (run_dir / "metrics.jsonl").write_text("".join(json.dumps(m) + "\n" for m in kept), encoding="utf-8")
 
 
 def mark_stale_runs(ws: Workspace) -> int:

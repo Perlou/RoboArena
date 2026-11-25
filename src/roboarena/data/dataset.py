@@ -27,6 +27,7 @@ from roboarena.core.log import get_logger
 from roboarena.core.seeding import derive_seed, make_rng
 from roboarena.data.collect import collect, noisy_replay_actions, random_walk_actions
 from roboarena.data.episodes import episode_digest, load_episode, save_episode
+from roboarena.data.rollouts import load_rollout_set
 from roboarena.data.validate import CHECKS, check_episode, check_replay
 from roboarena.store.runs import start_run
 from roboarena.store.workspace import Workspace
@@ -36,7 +37,7 @@ from roboarena.tasks.api import Episode, Task
 log = get_logger(__name__)
 
 SPLITS = ("train", "val", "test")
-N_REPLAY_CHECKS = 8  # 每种采集来源抽多少个回合做重放核对
+N_REPLAY_CHECKS = 8  # 每种采集来源大约抽多少个回合做重放核对（等间隔抽）
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,9 @@ def _plan_sources(task: Task, cfg: Config, cache: Path) -> Iterator[tuple[str, l
         ]
         yield "random_walk", collect(task, inits, seqs, metas, data.batch)
 
+    for set_name in data.rollouts:
+        yield f"rollouts:{set_name}", load_rollout_set(cache.parent, spec.name, set_name)
+
 
 def build_dataset(ws: Workspace, cfg: Config, *, force: bool = False) -> Dataset:
     """按配置生成数据集。任何一项校验不通过都会报错并且不留下清单。"""
@@ -164,7 +168,7 @@ def build_dataset(ws: Workspace, cfg: Config, *, force: bool = False) -> Dataset
             for n, ep in enumerate(episodes):
                 file = f"episodes/episode-{len(entries):06d}.npz"
                 failed = {k: v for k, v in check_episode(spec, ep).items() if v is not None}
-                if not failed and source != "demo" and n < N_REPLAY_CHECKS:
+                if not failed and source != "demo" and n % max(len(episodes) // N_REPLAY_CHECKS, 1) == 0:
                     replay_checked[source] = replay_checked.get(source, 0) + 1
                     if (message := check_replay(task, ep)) is not None:
                         failed["可重放"] = message
@@ -180,7 +184,7 @@ def build_dataset(ws: Workspace, cfg: Config, *, force: bool = False) -> Dataset
                 entries.append(
                     {
                         "file": file,
-                        "source": source,
+                        "source": ep.meta["source"],
                         "group": ep.meta["group"],
                         "length": len(ep),
                         "labeled": bool(ep.meta["labeled"]),

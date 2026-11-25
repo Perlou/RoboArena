@@ -35,7 +35,7 @@ src/roboarena/
   store/      工作区：SQLite、运行记录、注册表       （只依赖 core）
   tasks/      任务与仿真器接口；各任务的实现
   data/       回合文件、采集、校验、切分、指纹
-  policies/   策略接口与实现
+  policies/   策略接口；行为克隆与 Diffusion Policy；训练循环；策略库
   worldmodel/ 世界模型接口与实现                    （M3）
   sim/        NeuralSim                             （M3）
   eval/       评测器、统计、排行榜

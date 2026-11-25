@@ -15,9 +15,10 @@ def is_quick() -> bool:
 
 
 def get_device(prefer: str | None = None) -> torch.device:
-    """按 cuda → mps → cpu 选择设备；prefer 可强制指定（如测试里用 "cpu"）。"""
+    """按 cuda → mps → cpu 选择设备。prefer 或环境变量 ROBOARENA_DEVICE 可强制指定（测试里用 "cpu"）。"""
     import torch
 
+    prefer = prefer or os.environ.get("ROBOARENA_DEVICE")
     if prefer:
         return torch.device(prefer)
     if torch.cuda.is_available():

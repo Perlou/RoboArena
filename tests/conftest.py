@@ -51,6 +51,7 @@ register_policy_backend("toy_seek", _build_seek)
 
 @pytest.fixture(autouse=True)
 def _no_quick_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ROBOARENA_DEVICE", "cpu")  # 测试一律在 CPU 上跑：结果逐位确定
     monkeypatch.delenv("ROBOARENA_QUICK", raising=False)
     monkeypatch.delenv("ROBOARENA_CONFIG_DIR", raising=False)
 

@@ -66,7 +66,11 @@ def run_eval(
         raise RoboArenaError(f"暂时只支持真实仿真器（sim = {REAL}）；神经仿真器在 M3 加入")
     suite = load_suite(ws, spec.name, cfg.eval.suite)
     max_steps = cfg.eval.max_steps or spec.max_steps
-    key = (artifact.id, sim, suite.id, max_steps, cfg.eval.n_exec, cfg.eval.seed)
+    policy = build_policy(
+        artifact.backend, spec, artifact.params, checkpoint_path(ws, artifact), artifact.name
+    )
+    n_exec = min(cfg.eval.n_exec, policy.chunk)  # 分块比 n_exec 短的策略，整块执行
+    key = (artifact.id, sim, suite.id, max_steps, n_exec, cfg.eval.seed)
 
     if (existing := eval_store.find_eval(ws, key)) is not None:
         if existing["status"] == "done" and not force:
@@ -76,9 +80,6 @@ def run_eval(
             )
         eval_store.delete_eval(ws, existing["id"])  # 上次没跑完，或要求重跑
 
-    policy = build_policy(
-        artifact.backend, spec, artifact.params, checkpoint_path(ws, artifact), artifact.name
-    )
     inits = [task.decode_init(d) for d in suite.inits]
 
     with start_run(ws, "eval", config=cfg.to_dict(), config_toml=cfg.to_toml(), seed=cfg.eval.seed) as run:
@@ -89,7 +90,7 @@ def run_eval(
             task.make_real_sim,
             inits,
             max_steps=max_steps,
-            n_exec=cfg.eval.n_exec,
+            n_exec=n_exec,
             batch=cfg.eval.batch,
             make_rng=lambda start: make_rng(cfg.eval.seed, f"eval:{policy_name}:{start}"),
         )

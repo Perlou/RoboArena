@@ -227,7 +227,20 @@ class Policy(Protocol):
 ```
 
 策略只接收画面。评测器负责维护帧历史、把分块里的前若干个动作依次执行、再重新调用策略。
-「执行噪声」这类变体用包装器实现（包一个策略，在输出上加噪声），本身也是一个 `Policy`。
+「执行噪声」这类变体不是另一个网络：它和基准策略登记同一份检查点，只是构造参数里的 `exec_noise` 不同。
+
+需要训练的策略有两个后端，共用同一个画面编码器（4 层卷积 + 空间 softmax）和同一个训练循环：
+
+| 后端 | 做法 | 损失 | 配置段 |
+| --- | --- | --- | --- |
+| `bc` | 行为克隆：编码器后接两层全连接，直接回归动作分块 | L1 | `[policy]` |
+| `diffusion` | Diffusion Policy 的小型版本：带残差的全连接去噪网络，余弦噪声日程，DDIM 采样；登记的是 EMA 权重 | 预测噪声的 MSE | `[diffusion]` |
+
+网络只需要实现 `loss(frames, target, rng)` 和 `predict(frames, rng)` 两个方法，训练循环和 `NetPolicy` 包装不区分后端。
+训练只用数据集训练部分里的**演示**回合；加噪重放与随机游走是给世界模型准备的，不是好的模仿对象。
+
+**策略库**（`roboarena train zoo`）用四种办法把水平拉开，供一致性分析使用：基准策略训练过程中的快照（`<base>-step<N>`）、
+只用一部分演示重新训练（`<base>-demos<N>`）、给基准策略的动作加噪声（`<base>-noise<σ>`）、另一种算法（`dp`、`dp-step<N>`），再加随机策略。
 
 ### 4.5 评测循环
 
@@ -263,7 +276,7 @@ evaluate(policy, sim, suite, max_steps, n_exec):
 | `label__block_pose` | `[T+1, 3]` | float32 | 块的 x、y、朝向；人类演示里没有，填 NaN |
 | `progress` | `[T+1]` | float32 | 即 `coverage`。人类演示里由奖励还原（奖励 = `clip(coverage / 0.95, 0, 1)`），每个回合的首帧未知，填 NaN |
 | `success` | `[T+1]` | bool | |
-| `meta` | JSON 字符串 | | 来源（`demo` / `replay` / `random_walk`，M2 之后加 `policy:<名称>`）、序号、所属的组、初始状态、是否带标签 |
+| `meta` | JSON 字符串 | | 来源（`demo` / `replay` / `random_walk` / `policy:<名称>`）、序号、所属的组、初始状态、是否带标签 |
 
 人类演示以「T 帧 + T 动作」的形式发布，最后一个动作之后的画面不存在。转换时丢掉最后一个动作，得到 `T−1` 个动作配 `T` 帧。
 
@@ -289,7 +302,9 @@ workspace/suites/<任务>/<名称>.json   评测集：一组 InitState + 指纹
 
 ### 5.3 训练采样
 
-序列窗口采样：从一个回合里取连续的 `L` 步，不跨回合。标准规模下全部画面常驻内存
+策略训练的采样（`data/frames.py`）：随机取时刻 $t$，画面是 $o_{t-K+1..t}$（回合开头不够的用首帧补齐，与评测时填历史的方式一致），
+动作是 $a_{t..t+\mathrm{chunk}-1}$（回合末尾不够的重复最后一个动作）；画面做随机平移增强。
+世界模型训练用的序列窗口采样（从一个回合里取连续的 `L` 步，不跨回合）在 M3 加入。标准规模下全部画面常驻内存
 （人类演示的画面约 700 MB，已实测）；数据量超过内存上限时改为按回合懒加载，接口不变。
 
 ## 6. 存储
@@ -300,6 +315,8 @@ workspace/suites/<任务>/<名称>.json   评测集：一组 InitState + 指纹
 workspace/
 ├── roboarena.db
 ├── datasets/  suites/
+├── rollouts/<任务>/<名称>/   策略回合集：已登记的策略在真实仿真器里跑出来的回合，可并入数据集
+├── cache/                  下载的原始文件（如人类演示）
 ├── runs/<run_id>/
 │   ├── config.toml         生效的完整配置
 │   ├── meta.json           代码版本、是否有未提交改动、数据指纹、设备、起止时间
@@ -355,9 +372,15 @@ n_random_walk = …
 backend = "latent"
 context_frames = …
 
-[policy.bc]
+[policy]              # 行为克隆；Diffusion Policy 用同样结构的 [diffusion] 段
 obs_frames = …
 chunk = …
+snapshots = […]
+
+[zoo]
+n_demos = […]
+exec_noise = […]
+diffusion = true
 
 [eval]
 suite = "main"
@@ -375,13 +398,16 @@ roboarena data build            下载演示、采集、校验、切分、写清
 roboarena data info             显示数据集的校验报告
 roboarena data verify           重新读取全部回合文件，核对指纹并重跑检查
 roboarena data suite            生成评测集
-roboarena policy add|list       登记不需要训练的策略；列出策略
+roboarena data rollouts         让已登记的策略在真实仿真器里跑，记录成可并入数据集的回合
+roboarena policy add|list|remove    登记不需要训练的策略；列出策略；删除策略及其评测结果
 roboarena runs list             最近的运行记录
 roboarena task list             已注册的任务
 roboarena info                  设备、工作区概况
-roboarena train policy          训练一个策略并注册
+roboarena train policy          训练一个策略并注册（--backend bc|diffusion；--resume <运行编号> 续训）
+roboarena train zoo             训练并注册整个策略库（已有的跳过，可中途重来）
 roboarena train worldmodel      训练一个世界模型并注册
-roboarena eval run              在指定仿真器上评估指定策略（可一次指定多个）
+roboarena eval run              在指定仿真器上评估指定策略（可一次指定多个，或 --all）
+roboarena eval leaderboard      排行榜：成功率与 Wilson 区间
 roboarena eval agreement        计算一致性指标
 roboarena eval openloop         开环误差曲线与可信视野
 roboarena report                生成图表与结果表
@@ -534,7 +560,9 @@ PushT 的全流程冒烟在本机手动跑。
 - 每次运行记录：完整配置、代码版本与是否有未提交改动、数据指纹、种子、设备、依赖锁文件的摘要。
 - 随机数：每个组件用独立的发生器，由（全局种子，组件名）派生，避免「多采一个随机数，后面全变」。
 - 评测的确定性：`RealSim` 由初始状态决定；`NeuralSim`（latent 后端）无采样；策略的随机性来自传入的发生器。
-- 续训用的检查点保存模型、优化器、步数、随机数状态与数据采样位置。
+- 续训用的检查点保存模型、优化器、步数、随机数状态，以及 EMA 权重（如果开了）。训练中的全部随机性（取样、画面平移、
+  扩散的时刻与噪声）来自同一个 NumPy 发生器，所以恢复它的状态就恢复了数据采样位置。学习率由步数直接算出，不需要恢复调度器。
+  测试验证了：CPU 上中途中断再续训，权重、快照、指标与不中断时逐位相同。
 - MPS 上部分算子不保证逐位确定。要求逐位一致的测试在 CPU 上跑；MPS 上只要求指标在容差之内。
 
 ## 12. 测试策略

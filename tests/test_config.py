@@ -49,8 +49,24 @@ def test_bad_overrides_are_rejected():
         load_config("no-such-file.toml")
 
 
+def test_list_values(tmp_path):
+    cfg = load_config(
+        overrides=["policy.snapshots=[10, 20]", "zoo.exec_noise=[0.1, 1]", 'data.rollouts=["zoo"]']
+    )
+    assert (
+        cfg.policy.snapshots == [10, 20] and cfg.zoo.exec_noise == [0.1, 1.0] and cfg.data.rollouts == ["zoo"]
+    )
+    assert all(type(x) is float for x in cfg.zoo.exec_noise)
+    with pytest.raises(ConfigError, match=r"policy.snapshots\[1\] 应为 int"):
+        load_config(overrides=['policy.snapshots=[1, "x"]'])
+    with pytest.raises(ConfigError, match="应为列表"):
+        load_config(overrides=["policy.snapshots=3"])
+
+
 def test_toml_round_trip():
-    cfg = load_config(overrides=['workspace.root="a \\"quoted\\" dir"', "eval.max_steps=12"])
+    cfg = load_config(
+        overrides=['workspace.root="a \\"quoted\\" dir"', "eval.max_steps=12", "policy.snapshots=[5, 9]"]
+    )
     again = Config()
     from roboarena.config import _apply
 

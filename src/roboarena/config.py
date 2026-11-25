@@ -10,7 +10,7 @@ import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import Any, get_args, get_origin, get_type_hints
 
 from roboarena.core.device import is_quick
 from roboarena.core.errors import ConfigError
@@ -38,6 +38,55 @@ class DataConfig:
     val_frac: float = 0.1
     test_frac: float = 0.1
     batch: int = 16  # 采集时并行的回合数
+    rollouts: list[str] = field(default_factory=list)  # 并入哪些策略回合集（roboarena data rollouts 生成）
+
+
+@dataclass
+class RolloutConfig:
+    """策略回合集：让已登记的策略在真实仿真器里跑，记录下来当训练数据（主要给世界模型用）。"""
+
+    name: str = "zoo"
+    policies: list[str] = field(default_factory=list)  # 空表示当前任务的全部策略
+    per_policy: int = 16  # 每个策略跑多少个回合
+    extra_steps: int = 10  # 成功之后再多记录几步
+
+
+@dataclass
+class PolicyConfig:
+    """可训练策略的结构与训练参数。行为克隆用 [policy] 段，Diffusion Policy 用 [diffusion] 段。"""
+
+    obs_frames: int = 2  # 输入的历史帧数
+    chunk: int = 8  # 一次预测的动作个数
+    width: int = 32  # 卷积通道数的基数
+    hidden: int = 512  # 全连接层宽度
+    n_demos: int = -1  # 用训练集里的多少条演示；-1 表示全部
+    steps: int = 20000
+    batch: int = 128
+    lr: float = 3e-4
+    weight_decay: float = 1e-4
+    warmup: int = 500  # 学习率线性升温的步数，之后余弦衰减到 0
+    aug_shift: int = 4  # 训练时画面随机平移的最大像素数；0 表示不做
+    log_every: int = 100
+    eval_every: int = 1000  # 每隔多少步算一次验证损失并保存续训检查点
+    val_batches: int = 20
+    snapshots: list[int] = field(default_factory=list)  # 在这些步数把当时的权重另存并登记成独立的策略
+    ema: float = 0.0  # 权重的指数滑动平均；大于 0 时登记的是平均后的权重。扩散模型一般要开
+    diffusion_steps: int = 100  # 只对 Diffusion Policy 有效：训练时的加噪步数
+    sample_steps: int = 10  # 只对 Diffusion Policy 有效：采样时 DDIM 走几步
+
+
+@dataclass
+class ZooConfig:
+    """策略库：一组水平不同的策略。roboarena train zoo 按它训练并登记。"""
+
+    diffusion: bool = (
+        False  # 是否另外训练一个 Diffusion Policy（名称 dp，按 [diffusion] 段的 snapshots 留快照）
+    )
+    base: str = "bc"  # 用全部演示训练的那个策略的名称；其余策略的名称由它派生
+    n_demos: list[int] = field(default_factory=list)  # 另外用更少的演示各训练一个
+    exec_noise: list[float] = field(
+        default_factory=list
+    )  # 给 base 的动作加噪声，各登记一个；标准差占动作范围的比例
 
 
 @dataclass
@@ -56,6 +105,10 @@ class Config:
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     task: TaskConfig = field(default_factory=TaskConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    rollouts: RolloutConfig = field(default_factory=RolloutConfig)
+    policy: PolicyConfig = field(default_factory=PolicyConfig)
+    diffusion: PolicyConfig = field(default_factory=lambda: PolicyConfig(ema=0.999))
+    zoo: ZooConfig = field(default_factory=ZooConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
 
     def to_dict(self) -> dict[str, Any]:
@@ -68,7 +121,12 @@ class Config:
         return sha256_text(canonical_json(self.to_dict()))
 
 
-def _coerce(value: Any, expected: type, key: str) -> Any:
+def _coerce(value: Any, expected: Any, key: str) -> Any:
+    if get_origin(expected) is list:
+        if not isinstance(value, list):
+            raise ConfigError(f"配置项 {key} 应为列表，实际是 {type(value).__name__}：{value!r}")
+        (item_type,) = get_args(expected)
+        return [_coerce(v, item_type, f"{key}[{i}]") for i, v in enumerate(value)]
     if expected is float and type(value) is int:
         return float(value)
     if type(value) is not expected:

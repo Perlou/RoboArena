@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from roboarena.policies.api import Policy
-from roboarena.tasks.api import InitState, Simulator
+from roboarena.tasks.api import InitState, Simulator, StepResult
 
 
 @dataclass(frozen=True)
@@ -29,36 +29,48 @@ def evaluate(
     max_steps: int,
     n_exec: int,
     rng: np.random.Generator,
+    trace: list[tuple[np.ndarray | None, StepResult]] | None = None,
+    linger: int = 0,
 ) -> list[EpisodeResult]:
     """B = len(inits) 个回合并行推进。
 
     每次调用策略得到一段动作 [B, chunk, A]，执行其中前 n_exec 个，再重新调用策略。
     已成功的回合继续跟着批一起步进，但结果不再更新：批的形状不变，实现简单，代价是少量多余计算。
+    给了 trace 时，把每一步的（动作，仿真器返回）依次追加进去；第一项是重置的结果，动作为 None。
+    linger > 0 时，全部回合成功之后再多走 linger 步才停（采集数据时要成功之后的画面）；评测结果不受影响。
     """
     if not 1 <= n_exec <= policy.chunk:
         raise ValueError(f"n_exec = {n_exec} 应在 1 到策略的分块长度 {policy.chunk} 之间")
     n = len(inits)
-    frames = sim.reset(inits).frames  # [B, H, W, 3]
+    first = sim.reset(inits)
+    if trace is not None:
+        trace.append((None, first))
+    frames = first.frames  # [B, H, W, 3]
     history = np.repeat(frames[:, None], policy.obs_frames, axis=1)  # [B, obs_frames, H, W, 3]
     done = np.zeros(n, dtype=bool)
     best = np.zeros(n, dtype=np.float32)
     steps = np.full(n, max_steps, dtype=np.int64)
 
     t = 0
-    while t < max_steps and not done.all():
+    stop_at = max_steps  # 全部成功之后改成"成功那一步 + linger"
+    while t < stop_at:
         chunk = np.asarray(policy.act(history, rng))
         if chunk.ndim != 3 or chunk.shape[:2] != (n, policy.chunk):
             raise ValueError(f"策略 {policy.name} 输出的形状是 {chunk.shape}，应为 [{n}, {policy.chunk}, A]")
         for k in range(n_exec):
-            if t >= max_steps or done.all():
+            if t >= stop_at:
                 break
             result = sim.step(chunk[:, k])
+            if trace is not None:
+                trace.append((chunk[:, k].copy(), result))
             t += 1
             active = ~done
             best[active] = np.maximum(best[active], result.progress[active])
             newly = active & result.success
             steps[newly] = t
             done |= newly
+            if done.all() and stop_at == max_steps:
+                stop_at = min(t + linger, max_steps)
             history = np.concatenate([history[:, 1:], result.frames[:, None]], axis=1)
 
     return [EpisodeResult(bool(done[i]), float(best[i]), int(steps[i])) for i in range(n)]

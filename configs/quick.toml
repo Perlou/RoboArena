@@ -10,6 +10,43 @@ random_walk_steps = 20
 val_frac = 0.25
 test_frac = 0.25
 
+[policy]
+obs_frames = 2
+chunk = 4
+width = 8
+hidden = 32
+steps = 60
+batch = 16
+warmup = 5
+aug_shift = 1
+log_every = 10
+eval_every = 20
+val_batches = 2
+snapshots = [20]
+
+[diffusion]
+obs_frames = 2
+chunk = 4
+width = 8
+hidden = 32
+steps = 60
+batch = 16
+warmup = 5
+aug_shift = 1
+log_every = 10
+eval_every = 20
+val_batches = 2
+snapshots = [20]
+ema = 0.9
+diffusion_steps = 20
+sample_steps = 4
+
+[zoo]
+n_demos = [2]
+exec_noise = [0.3]
+diffusion = true
+
 [eval]
 n_inits = 16
 batch = 16
+n_exec = 2

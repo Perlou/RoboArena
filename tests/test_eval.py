@@ -110,6 +110,28 @@ def test_runner_stops_early_when_all_succeed():
     assert len(sim.actions) == 2
 
 
+def test_runner_trace_and_linger():
+    sim, trace = CountingSim(), []
+    results = evaluate(
+        ChunkPolicy(),
+        sim,
+        [1, 2],
+        max_steps=50,
+        n_exec=2,
+        rng=np.random.default_rng(0),
+        trace=trace,
+        linger=3,
+    )
+    assert [(r.success, r.steps) for r in results] == [(True, 1), (True, 2)]  # 多走的几步不改变结果
+    assert len(sim.actions) == 5 and len(trace) == 6  # 全部成功在第 2 步，再走 3 步；trace 多一项重置
+    assert trace[0][0] is None and [a[0, 0] for a, _ in trace[1:]] == [0, 1, 100, 101, 200]
+    assert [r.frames[0, 0, 0, 0] for _, r in trace] == [0, 1, 2, 3, 4, 5]
+
+    sim = CountingSim()
+    evaluate(ChunkPolicy(), sim, [1, 2], max_steps=3, n_exec=2, rng=np.random.default_rng(0), linger=10)
+    assert len(sim.actions) == 3  # 不超过步数上限
+
+
 def test_runner_rejects_bad_n_exec_and_bad_policy_output():
     with pytest.raises(ValueError, match="n_exec"):
         _eval(ChunkPolicy(chunk=2), CountingSim(), [0], n_exec=3)

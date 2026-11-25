@@ -99,6 +99,19 @@ def list_artifacts(ws: Workspace, task: str | None = None, kind: str | None = No
     return [_from_row(r) for r in rows]
 
 
+def delete_artifact(ws: Workspace, name: str) -> int:
+    """删除一个条目和它的全部评测结果，返回删掉的评测次数。检查点没有别的条目在用时一并删除。运行记录保留。"""
+    artifact = get_artifact(ws, name)
+    with ws.db:
+        n_evals = ws.db.execute("DELETE FROM evals WHERE policy_id = ?", (artifact.id,)).rowcount
+        ws.db.execute("DELETE FROM artifacts WHERE id = ?", (artifact.id,))
+    if artifact.path is not None:
+        shared = ws.db.execute("SELECT 1 FROM artifacts WHERE path = ?", (artifact.path,)).fetchone()
+        if shared is None:
+            ws.abs(artifact.path).unlink(missing_ok=True)
+    return n_evals
+
+
 def checkpoint_path(ws: Workspace, artifact: Artifact) -> Path | None:
     """返回检查点的绝对路径，并核对内容哈希。不带权重的条目返回 None。"""
     if artifact.path is None:

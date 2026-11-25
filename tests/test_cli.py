@@ -67,7 +67,7 @@ def test_task_list(run):
     assert code == 0 and "\ntoy：" in out and '"max_steps": 30' in out and out.startswith("pusht：")
 
 
-@pytest.mark.parametrize("command", ["train", "report", "pipeline", "bench", "serve", "token"])
+@pytest.mark.parametrize("command", ["report", "pipeline", "bench", "serve", "token"])
 def test_planned_commands_say_so(run, command):
     code, _, err = run(command)
     assert code == 2 and "尚未实现" in err
