@@ -1,0 +1,7 @@
+# 本机（M1 Max）的标准规模。各阶段的模型与训练参数随里程碑加入。
+[task]
+name = "pusht"
+
+[eval]
+n_inits = 50
+batch = 16
