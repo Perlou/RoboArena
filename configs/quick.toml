@@ -2,6 +2,14 @@
 [task]
 name = "toy"
 
+[data]
+n_demos = 8
+n_replay = 8
+n_random_walk = 8
+random_walk_steps = 20
+val_frac = 0.25
+test_frac = 0.25
+
 [eval]
 n_inits = 16
 batch = 16

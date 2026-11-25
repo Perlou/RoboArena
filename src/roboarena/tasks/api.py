@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
@@ -50,11 +51,26 @@ class StepResult:
     labels: dict[str, np.ndarray] = field(default_factory=dict)  # 任务声明的标签，各 [B, D]
 
 
+@dataclass
+class Episode:
+    """一个回合。下标 t 处放 o_t、a_t；T 个动作配 T + 1 帧。不知道的进度与标签填 NaN。"""
+
+    frames: np.ndarray  # [T+1, H, W, 3] uint8
+    actions: np.ndarray  # [T, A] float32，环境坐标
+    progress: np.ndarray  # [T+1] float32
+    success: np.ndarray  # [T+1] bool
+    labels: dict[str, np.ndarray]  # 各 [T+1, D] float32
+    meta: dict[str, Any] = field(default_factory=dict)  # 来源、序号、初始状态（序列化后的）等
+
+    def __len__(self) -> int:
+        return len(self.actions)
+
+
 class Simulator(Protocol):
     name: str
 
-    def reset(self, inits: Sequence[InitState]) -> np.ndarray:
-        """把 B = len(inits) 个回合设到给定的初始状态，返回首帧 [B, H, W, 3]。"""
+    def reset(self, inits: Sequence[InitState]) -> StepResult:
+        """把 B = len(inits) 个回合设到给定的初始状态，返回初始时刻的画面、进度与标签。"""
         ...
 
     def step(self, actions: np.ndarray) -> StepResult:
@@ -80,3 +96,7 @@ class Task(Protocol):
         ...
 
     def decode_init(self, data: dict[str, Any]) -> InitState: ...
+
+    def demos(self, cache_dir: Path, limit: int | None = None) -> list[Episode]:
+        """任务自带的演示回合（如人类遥操作数据）。需要下载的文件缓存在 cache_dir 下。"""
+        ...

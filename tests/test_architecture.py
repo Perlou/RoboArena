@@ -25,7 +25,7 @@ FORBIDDEN = {("policies", "worldmodel")}
 THIRD_PARTY = {"fastapi": "serve/", "gym_pusht": "tasks/pusht/", "gymnasium": "tasks/pusht/"}
 # 某个任务专有的名字，不许出现在与任务无关的模块里
 TASK_WORDS = ("coverage", "pusht", "block_pose")
-TASK_AGNOSTIC = ("policies", "worldmodel", "sim", "eval", "serve")
+TASK_AGNOSTIC = ("data", "policies", "worldmodel", "sim", "eval", "serve")
 
 
 def _unit(path: Path) -> str:

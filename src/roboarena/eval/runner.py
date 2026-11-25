@@ -38,7 +38,7 @@ def evaluate(
     if not 1 <= n_exec <= policy.chunk:
         raise ValueError(f"n_exec = {n_exec} 应在 1 到策略的分块长度 {policy.chunk} 之间")
     n = len(inits)
-    frames = sim.reset(inits)  # [B, H, W, 3]
+    frames = sim.reset(inits).frames  # [B, H, W, 3]
     history = np.repeat(frames[:, None], policy.obs_frames, axis=1)  # [B, obs_frames, H, W, 3]
     done = np.zeros(n, dtype=bool)
     best = np.zeros(n, dtype=np.float32)

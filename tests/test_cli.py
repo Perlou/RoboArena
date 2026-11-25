@@ -64,7 +64,7 @@ def test_empty_listings(run):
 
 def test_task_list(run):
     code, out, _ = run("task", "list")
-    assert code == 0 and out.startswith("toy：") and '"max_steps": 30' in out
+    assert code == 0 and "\ntoy：" in out and '"max_steps": 30' in out and out.startswith("pusht：")
 
 
 @pytest.mark.parametrize("command", ["train", "report", "pipeline", "bench", "serve", "token"])

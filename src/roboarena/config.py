@@ -28,6 +28,19 @@ class TaskConfig:
 
 
 @dataclass
+class DataConfig:
+    name: str = "main"  # 数据集的名称
+    n_demos: int = -1  # 用多少条任务自带的演示；-1 表示全部，0 表示不用
+    n_replay: int = 300  # 演示动作加噪、从随机初始状态重放的回合数
+    replay_noise: float = 0.03  # 噪声标准差占动作范围的比例；每个回合在 0 到 2 倍之间取一个强度
+    n_random_walk: int = 200  # 随机游走的回合数
+    random_walk_steps: int = 150  # 每个随机游走回合的步数
+    val_frac: float = 0.1
+    test_frac: float = 0.1
+    batch: int = 16  # 采集时并行的回合数
+
+
+@dataclass
 class EvalConfig:
     suite: str = "main"  # 评测集的名称
     n_inits: int = 50  # 评测集里初始状态的个数（只在生成评测集时用）
@@ -42,6 +55,7 @@ class Config:
     seed: int = 0
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     task: TaskConfig = field(default_factory=TaskConfig)
+    data: DataConfig = field(default_factory=DataConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
 
     def to_dict(self) -> dict[str, Any]:

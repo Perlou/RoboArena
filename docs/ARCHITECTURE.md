@@ -150,6 +150,7 @@ class Task(Protocol):
     def make_real_sim(self) -> Simulator: ...  # 回合数在 reset 时由 inits 的个数决定
     def encode_init(self, init: InitState) -> dict: ...  # 序列化成 JSON，存进评测集
     def decode_init(self, data: dict) -> InitState: ...
+    def demos(self, cache_dir: Path, limit: int | None = None) -> list[Episode]: ...  # 任务自带的演示
 ```
 
 `InitState` 对评测器是不透明的：评测器只把它从评测集里取出来交给仿真器。
@@ -172,7 +173,7 @@ class StepResult:
 class Simulator(Protocol):
     name: str
 
-    def reset(self, inits: Sequence[InitState]) -> np.ndarray: ...  # 返回首帧 [B, H, W, 3]
+    def reset(self, inits: Sequence[InitState]) -> StepResult: ...  # 初始时刻的画面、进度与标签
     def step(self, actions: np.ndarray) -> StepResult: ...  # actions [B, A]
     def close(self) -> None: ...
 ```
@@ -258,11 +259,11 @@ evaluate(policy, sim, suite, max_steps, n_exec):
 | --- | --- | --- | --- |
 | `frames` | `[T+1, 96, 96, 3]` | uint8 | |
 | `actions` | `[T, 2]` | float32 | 环境坐标 0–512 |
-| `agent_pos` | `[T+1, 2]` | float32 | 推杆位置 |
-| `block_pose` | `[T+1, 3]` | float32 | 块的 x、y、朝向；人类演示里没有，填 NaN |
-| `progress` | `[T+1]` | float32 | 即 `coverage`；人类演示里没有，填 NaN |
+| `label__agent_pos` | `[T+1, 2]` | float32 | 推杆位置 |
+| `label__block_pose` | `[T+1, 3]` | float32 | 块的 x、y、朝向；人类演示里没有，填 NaN |
+| `progress` | `[T+1]` | float32 | 即 `coverage`。人类演示里由奖励还原（奖励 = `clip(coverage / 0.95, 0, 1)`），每个回合的首帧未知，填 NaN |
 | `success` | `[T+1]` | bool | |
-| `meta` | JSON 字符串 | | 来源（`human` / `noisy_replay` / `random_walk` / `policy:<名称>`）、种子、初始状态、是否带标签 |
+| `meta` | JSON 字符串 | | 来源（`demo` / `replay` / `random_walk`，M2 之后加 `policy:<名称>`）、序号、所属的组、初始状态、是否带标签 |
 
 人类演示以「T 帧 + T 动作」的形式发布，最后一个动作之后的画面不存在。转换时丢掉最后一个动作，得到 `T−1` 个动作配 `T` 帧。
 
@@ -273,13 +274,17 @@ evaluate(policy, sim, suite, max_steps, n_exec):
 ```
 workspace/datasets/<任务>/<名称>/
 ├── episodes/episode-000000.npz …
-├── manifest.json          回合清单：文件、长度、来源、内容摘要；切分；指纹；动作与位姿的归一化统计量
+├── manifest.json          回合清单：文件、长度、来源、所属的组、内容摘要；切分；指纹；动作与标签的归一化统计量
 └── REPORT.md              校验报告
 workspace/suites/<任务>/<名称>.json   评测集：一组 InitState + 指纹
 ```
 
 - **指纹**：对每个回合文件里各数组的原始字节求 SHA-256，再对排序后的摘要列表求一次。不直接对 `.npz` 文件求哈希，因为压缩包里含时间戳。
-- **切分**：按回合划分，由种子决定，写在清单里。归一化统计量只用训练部分计算。
+- **切分**：按「组」划分，由种子决定，写在清单里。一条演示和由它加噪重放出来的回合属于同一组，整组进同一个子集，
+  否则验证集里会出现和训练集共用同一条动作序列的回合。演示组与其他组分开洗牌，保证每个子集里两类数据都有。
+  归一化统计量只用训练部分计算。
+- **校验**：生成时逐回合检查形状与类型、动作范围、数值范围、标签完整；仿真器内采集的回合每种来源抽查若干个做重放
+  （从记录的初始状态重新执行动作，画面逐像素相同）。任何一项不通过，数据集不会写出清单。
 - **评测集**：初始状态由独立的种子序列生成，与数据采集用的种子不相交。
 
 ### 5.3 训练采样
@@ -343,7 +348,7 @@ root = "workspace"
 name = "pusht"
 
 [data]
-n_noisy_replay = …
+n_replay = …
 n_random_walk = …
 
 [worldmodel]
@@ -367,6 +372,8 @@ n_exec = …
 
 ```
 roboarena data build            下载演示、采集、校验、切分、写清单
+roboarena data info             显示数据集的校验报告
+roboarena data verify           重新读取全部回合文件，核对指纹并重跑检查
 roboarena data suite            生成评测集
 roboarena policy add|list       登记不需要训练的策略；列出策略
 roboarena runs list             最近的运行记录

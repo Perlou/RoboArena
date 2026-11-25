@@ -51,11 +51,14 @@ class CountingSim:
     def reset(self, inits):
         self.succeed_at = np.array(inits)
         self.t = 0
-        return np.zeros((len(inits), 2, 2, 3), dtype=np.uint8)
+        return self._result()
 
     def step(self, actions):
         self.t += 1
         self.actions.append(np.array(actions))
+        return self._result()
+
+    def _result(self):
         n = len(self.succeed_at)
         return StepResult(
             frames=np.full((n, 2, 2, 3), self.t, dtype=np.uint8),

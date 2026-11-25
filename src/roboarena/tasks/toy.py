@@ -14,11 +14,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from roboarena.tasks.api import Simulator, StepResult, Task, TaskSpec
+from roboarena.tasks.api import Episode, Simulator, StepResult, Task, TaskSpec
 
 SIZE = 32
 MAX_MOVE = 0.15
@@ -54,10 +55,10 @@ class ToySim:
         self.agent = np.zeros((0, 2), dtype=np.float32)
         self.goal = np.zeros((0, 2), dtype=np.float32)
 
-    def reset(self, inits: Sequence[ToyInit]) -> np.ndarray:
-        self.agent = np.array([i.agent for i in inits], dtype=np.float32)
-        self.goal = np.array([i.goal for i in inits], dtype=np.float32)
-        return render(self.agent, self.goal)
+    def reset(self, inits: Sequence[ToyInit]) -> StepResult:
+        self.agent = np.array([i.agent for i in inits], dtype=np.float32).reshape(-1, 2)
+        self.goal = np.array([i.goal for i in inits], dtype=np.float32).reshape(-1, 2)
+        return self._observe()
 
     def step(self, actions: np.ndarray) -> StepResult:
         target = np.clip(np.asarray(actions, dtype=np.float32), 0.0, 1.0)
@@ -65,6 +66,9 @@ class ToySim:
         length = np.linalg.norm(delta, axis=1, keepdims=True)
         scale = np.minimum(1.0, MAX_MOVE / np.maximum(length, 1e-8))
         self.agent = (self.agent + delta * scale).astype(np.float32)
+        return self._observe()
+
+    def _observe(self) -> StepResult:
         dist = np.linalg.norm(self.agent - self.goal, axis=1)
         return StepResult(
             frames=render(self.agent, self.goal),
@@ -103,6 +107,30 @@ class ToyTask:
         ax, ay = data["agent"]
         gx, gy = data["goal"]
         return ToyInit(agent=(float(ax), float(ay)), goal=(float(gx), float(gy)))
+
+    def demos(self, cache_dir: Path, limit: int | None = None) -> list[Episode]:
+        """脚本生成的演示：每步的动作是目标位置加一点噪声。固定种子，每次调用结果相同。"""
+        n, steps = (32 if limit is None else limit), 12
+        rng = np.random.default_rng(20261125)
+        episodes = []
+        for index, init in enumerate(self.sample_inits(n, seed=20261125)):
+            sim = ToySim()
+            results = [sim.reset([init])]
+            actions = np.clip(np.array(init.goal) + rng.normal(0, 0.03, size=(steps, 2)), 0, 1).astype(
+                np.float32
+            )
+            results += [sim.step(a[None]) for a in actions]
+            episodes.append(
+                Episode(
+                    frames=np.concatenate([r.frames for r in results]),
+                    actions=actions,
+                    progress=np.concatenate([r.progress for r in results]),
+                    success=np.concatenate([r.success for r in results]),
+                    labels={"agent_pos": np.concatenate([r.labels["agent_pos"] for r in results])},
+                    meta={"source": "demo", "index": index, "init": self.encode_init(init)},
+                )
+            )
+        return episodes
 
 
 def make_task() -> Task:

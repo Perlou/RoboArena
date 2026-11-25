@@ -5,9 +5,10 @@ from __future__ import annotations
 import importlib
 
 from roboarena.core.errors import NotFoundError
-from roboarena.tasks.api import InitState, Simulator, StepResult, Task, TaskSpec
+from roboarena.tasks.api import Episode, InitState, Simulator, StepResult, Task, TaskSpec
 
 __all__ = [
+    "Episode",
     "InitState",
     "Simulator",
     "StepResult",
@@ -20,6 +21,7 @@ __all__ = [
 
 # 名称 → "模块:工厂函数"
 _FACTORIES: dict[str, str] = {
+    "pusht": "roboarena.tasks.pusht:make_task",
     "toy": "roboarena.tasks.toy:make_task",
 }
 

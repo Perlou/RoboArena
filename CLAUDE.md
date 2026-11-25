@@ -34,7 +34,7 @@ src/roboarena/
   config.py   dataclass 配置 + TOML + 覆盖          （只依赖 core）
   store/      工作区：SQLite、运行记录、注册表       （只依赖 core）
   tasks/      任务与仿真器接口；各任务的实现
-  data/       数据管线                              （M1）
+  data/       回合文件、采集、校验、切分、指纹
   policies/   策略接口与实现
   worldmodel/ 世界模型接口与实现                    （M3）
   sim/        NeuralSim                             （M3）
@@ -82,8 +82,11 @@ M5a 服务 → M5b 前端 → M6 消融、报告、容器、持续集成。
 ## 环境
 
 - Python 3.12，`uv` 管理。本机是 M1 Max 32 GB，没有 NVIDIA GPU；重训练可选 4090（`configs/cloud.toml`，尚未建立）。
-- `gym-pusht` 在 M1 才加入。它声明依赖 `pygame` 和带界面的 `opencv-python`，要在 `[tool.uv] override-dependencies`
-  里排除，改用 `pygame-ce` 与 `opencv-python-headless`（课程仓库已验证过这个写法）。
+- `gym-pusht` 声明依赖 `pygame` 和带界面的 `opencv-python`，已在 `[tool.uv] override-dependencies` 里排除，
+  改用 `pygame-ce` 与 `opencv-python-headless`。不要用 `pip install` 绕过。
+- PushT 人类演示第一次用到时下载到 `workspace/cache/pusht/raw/`（约 8 MB）。访问不了 huggingface.co 时设
+  `HF_ENDPOINT=https://hf-mirror.com`。依赖演示数据的测试在没有缓存时自动跳过。
+- `gym-pusht` 的一个坑：`reset_to_state` 设定朝向时块的位置会偏移，传入的块坐标不等于重置后读到的位姿。
 - `workspace/` 是运行产物，不入库。
 
 ## 不要做的事

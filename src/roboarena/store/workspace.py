@@ -8,7 +8,7 @@ from types import TracebackType
 
 from roboarena.store.db import connect
 
-SUBDIRS = ("runs", "artifacts", "suites", "datasets", "reports")
+SUBDIRS = ("runs", "artifacts", "suites", "datasets", "reports", "cache")
 
 
 class Workspace:

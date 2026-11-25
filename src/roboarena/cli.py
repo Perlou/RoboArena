@@ -12,6 +12,7 @@ from roboarena.config import Config, load_config
 from roboarena.core.device import get_device, is_quick
 from roboarena.core.errors import RoboArenaError
 from roboarena.core.log import setup_logging
+from roboarena.data.dataset import build_dataset, load_dataset, render_report, verify_dataset
 from roboarena.eval import service
 from roboarena.policies import list_policy_backends
 from roboarena.store.registry import list_artifacts, register_artifact
@@ -72,6 +73,39 @@ def cmd_data_suite(cfg: Config, args: argparse.Namespace) -> int:
         suite = service.create_suite(ws, cfg)
     print(
         f"已生成评测集 {suite.task}/{suite.name}：{len(suite.inits)} 个初始状态，指纹 {suite.fingerprint[:12]}"
+    )
+    return 0
+
+
+def cmd_data_build(cfg: Config, args: argparse.Namespace) -> int:
+    with Workspace(cfg.workspace.root) as ws:
+        dataset = build_dataset(ws, cfg, force=args.force)
+    m = dataset.manifest
+    print(
+        f"已生成数据集 {m['task']}/{m['name']}：{m['n_episodes']} 个回合，{m['n_frames']} 帧，指纹 {m['fingerprint'][:12]}"
+    )
+    print(f"校验报告：{dataset.dir / 'REPORT.md'}")
+    return 0
+
+
+def cmd_data_info(cfg: Config, args: argparse.Namespace) -> int:
+    with Workspace(cfg.workspace.root) as ws:
+        dataset = load_dataset(ws, get_task(cfg.task.name).spec.name, cfg.data.name)
+    print(render_report(dataset), end="")
+    return 0
+
+
+def cmd_data_verify(cfg: Config, args: argparse.Namespace) -> int:
+    task = get_task(cfg.task.name)
+    with Workspace(cfg.workspace.root) as ws:
+        dataset = load_dataset(ws, task.spec.name, cfg.data.name)
+        problems = verify_dataset(dataset, task)
+    if problems:
+        print(f"数据集 {task.spec.name}/{cfg.data.name} 有 {len(problems)} 个问题：", file=sys.stderr)
+        print("\n".join(f"  {p}" for p in problems[:20]), file=sys.stderr)
+        return 1
+    print(
+        f"数据集 {task.spec.name}/{cfg.data.name} 核对通过：{dataset.manifest['n_episodes']} 个回合，指纹 {dataset.fingerprint[:12]}"
     )
     return 0
 
@@ -172,7 +206,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     leaf(group("task", "任务插件"), "list", "列出已注册的任务及其规格", cmd_task_list)
 
-    leaf(group("data", "数据与评测集"), "suite", "按配置生成评测集（一组固定的初始状态）", cmd_data_suite)
+    data = group("data", "数据与评测集")
+    p = leaf(data, "build", "生成数据集：演示 + 仿真器内采集，校验、切分、算指纹", cmd_data_build)
+    p.add_argument("--force", action="store_true", help="数据集已存在时删掉重建")
+    leaf(data, "info", "显示数据集的校验报告", cmd_data_info)
+    leaf(data, "verify", "重新读取全部回合文件，核对指纹并重跑检查", cmd_data_verify)
+    leaf(data, "suite", "按配置生成评测集（一组固定的初始状态）", cmd_data_suite)
 
     policy = group("policy", "策略注册表")
     p = leaf(policy, "add", "登记一个不需要训练的策略", cmd_policy_add)

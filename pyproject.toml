@@ -7,6 +7,13 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "numpy>=2.0",
     "torch>=2.7",
+    # PushT 任务的真实仿真器。它声明依赖 pygame 和带界面的 opencv-python，见下面 [tool.uv]
+    "gym-pusht>=0.1.8",
+    "pygame-ce>=2.5",
+    "opencv-python-headless>=4.9",
+    # 读取 LeRobot 格式的人类演示（parquet + mp4），不安装 lerobot 本体
+    "pyarrow>=18",
+    "imageio[ffmpeg]>=2.34",
 ]
 
 [project.scripts]
@@ -14,6 +21,14 @@ roboarena = "roboarena.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.8", "pyright>=1.1.380"]
+
+[tool.uv]
+# gym-pusht 声明依赖 pygame 与 opencv-python：前者与 pygame-ce 装进同一个目录互相覆盖，
+# 后者自带一份 SDL2。两者都排除，改用 pygame-ce 与 headless 版 OpenCV（API 兼容）。
+override-dependencies = [
+    "pygame ; sys_platform == 'never'",
+    "opencv-python ; sys_platform == 'never'",
+]
 
 [build-system]
 requires = ["hatchling"]
