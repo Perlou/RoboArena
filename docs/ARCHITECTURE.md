@@ -1,6 +1,6 @@
 # RoboArena 架构文档
 
-> 版本：v0.2（已纳入评审结论，待确认） ｜ 日期：2026-11-25 ｜ 配套文档：[REQUIREMENTS.md](./REQUIREMENTS.md)
+> 版本：v0.3（加入大模型应用层；与 M2 的实现对齐） ｜ 日期：2026-11-26 ｜ 配套文档：[REQUIREMENTS.md](./REQUIREMENTS.md)、[PLAN.md](./PLAN.md)
 >
 > 本文档描述系统怎么搭：模块、接口、数据格式、存储、服务协议、部署。
 > 模型的具体宽度、层数等超参数不在这里定，它们在最小版本跑出结果后写进配置文件。
@@ -45,6 +45,9 @@
 
 图里的「gym-pusht」是当前唯一的任务。任务以插件形式接入（第 4.1 节），评测器、服务、前端都不认识具体任务。
 
+v0.3 起，平台之上还有一层大模型应用（第 16 节）：用自然语言操作平台的 Agent、模型网关、AI 评测、领域小模型。
+它只调用平台已有的公开函数，结果同样写进工作区；平台一侧的代码不依赖它。
+
 ## 2. 仓库结构
 
 ```
@@ -56,7 +59,8 @@ RoboArena/
 ├── docs/
 │   ├── REQUIREMENTS.md
 │   ├── ARCHITECTURE.md
-│   └── PLAN.md                一页纸实验计划：预注册的消融、可信视野的阈值（M4 之前写定）
+│   ├── PROGRESS.md            进度与实测结果
+│   └── PLAN.md                实验计划：应用层预注册的指标、用例分桶、止损阈值；消融与可信视野的阈值（M4 之前写定）
 ├── configs/
 │   ├── quick.toml             冒烟：数分钟跑完全流程
 │   ├── local.toml             本机 M1 Max 的标准规模
@@ -72,6 +76,10 @@ RoboArena/
 │   ├── worldmodel/            世界模型接口、latent 后端、训练
 │   ├── policies/              策略接口、行为克隆、Diffusion Policy、随机策略、训练
 │   ├── eval/                  评测器、统计、一致性分析、诊断、报告
+│   ├── llm/                   模型网关：统一接口、适配器、重试降级、缓存、调用记录        （第 16 节，下同）
+│   ├── agent/                 工具注册表、规划与执行循环、权限、记忆、结果校验
+│   ├── aieval/                AI 评测：用例、固定工作区、运行、打分
+│   ├── tune/                  领域小模型：语料、LoRA 微调、导出与部署
 │   └── serve/                 FastAPI 应用、鉴权、指标、任务执行器、遥操作会话
 ├── web/                       前端工程（React + Vite + TypeScript）
 │   ├── src/api/               由 OpenAPI 生成的类型 + 请求封装
@@ -122,6 +130,9 @@ RoboArena/
 
 有一条测试专门检查这些导入规则（扫描各模块的 `import` 语句）。
 
+大模型应用层的四个单元（`llm`、`agent`、`aieval`、`tune`）排在 `eval` 之上、`cli` 与 `serve` 之下，层级与规则见第 16.1 节。
+上图里的单元都不导入它们。
+
 ## 4. 核心接口
 
 张量形状约定：`B` 批大小（并行回合数），`K` 上下文帧数，`T` 时间长度。
@@ -140,7 +151,7 @@ class TaskSpec:
     action_high: np.ndarray  # [A]
     control_hz: float  # 10
     max_steps: int  # 300
-    label_fields: dict[str, int]  # 判定头要回归的量及其维度，PushT：{"block_pose": 3}
+    label_fields: dict[str, int]  # 判定头要回归的量及其维度，PushT：{"block_pose": 3, "agent_pos": 2}
 
 
 class Task(Protocol):
@@ -260,6 +271,9 @@ evaluate(policy, sim, suite, max_steps, n_exec):
 
 已结束的回合继续参与批量前向但结果被屏蔽，这样批的形状不变，实现简单；代价是少量多余计算。
 
+评测循环另有两个只在采集策略回合时用的参数：`trace` 把每一步的（动作，仿真器返回）记下来；`linger` 让全部回合成功之后再多走几步
+（数据里要有成功之后的画面）。两者都不改变评测结果。策略的分块比 `n_exec` 短时，整块执行。
+
 ## 5. 数据
 
 ### 5.1 回合文件
@@ -316,18 +330,21 @@ workspace/
 ├── roboarena.db
 ├── datasets/  suites/
 ├── rollouts/<任务>/<名称>/   策略回合集：已登记的策略在真实仿真器里跑出来的回合，可并入数据集
-├── cache/                  下载的原始文件（如人类演示）
+├── cache/                  下载的原始文件（如人类演示）；cache/llm/ 是模型调用的缓存
+├── corpora/<名称>/          微调语料：样本、清单、指纹、报告（A3）
 ├── runs/<run_id>/
 │   ├── config.toml         生效的完整配置
 │   ├── meta.json           代码版本、是否有未提交改动、数据指纹、设备、起止时间
 │   ├── metrics.jsonl       每行一条：步数、指标名、值
-│   ├── checkpoints/        last.pt（续训用，含优化器与随机数状态）、best.pt
+│   ├── checkpoints/        last.pt（续训用，含优化器与随机数状态）、step-<N>.pt（登记时的权重）
+│   ├── llm_calls.jsonl     这次运行里的每一次模型调用（应用层的运行才有）
 │   └── log.txt
-├── artifacts/<sha256 前缀>/  已注册的检查点（只含权重与构造参数）
+├── artifacts/<前两位>/<sha256>/  已注册的检查点（只含权重；构造参数在数据库里）
 └── reports/                生成的图表
 ```
 
-`run_id` 形如 `20261125-213005-wm-latent-a1b2`（时间 + 类型 + 配置摘要的前几位）。
+`run_id` 形如 `20261126-005938-train_policy-0e96ec17`（时间 + 类型 + 配置摘要的前 4 位 + 4 位随机数）。
+采集策略回合（`data rollouts`）也留一条 `data` 类型的运行记录，里面记着用了哪些策略的哪份权重。
 
 ### 6.2 数据库表
 
@@ -335,17 +352,25 @@ workspace/
 
 | 表 | 主要字段 | 说明 |
 | --- | --- | --- |
-| `runs` | `id`、`kind`（`data` / `train_policy` / `train_wm` / `eval`）、`status`、`config_json`、`git_rev`、`git_dirty`、`dataset_fp`、`seed`、`started_at`、`finished_at` | 每次命令行或任务执行一行 |
+| `runs` | `id`、`kind`（`data` / `train_policy` / `train_wm` / `eval` / `chat` / `aieval` / `tune`）、`status`、`config_json`、`git_rev`、`git_dirty`、`dataset_fp`、`seed`、`started_at`、`finished_at` | 每次命令行或任务执行一行 |
 | `artifacts` | `id`、`task`、`name`（唯一）、`kind`（`policy` / `worldmodel`）、`backend`、`sha256`、`path`、`run_id`、`params_json`、`created_at` | 注册表 |
 | `suites` | `id`、`task`、`name`、`fingerprint`、`n_inits`、`path` | 评测集 |
-| `evals` | `id`、`policy_id`、`sim`（`real` 或世界模型的 `artifact id`）、`suite_id`、`max_steps`、`seed`、`run_id`、`status` | 一次评测；前六个字段联合唯一 |
+| `evals` | `id`、`policy_id`、`sim`（`real` 或世界模型的 `artifact id`）、`suite_id`、`max_steps`、`n_exec`、`seed`、`run_id`、`status` | 一次评测；`policy_id` 到 `seed` 六个字段联合唯一 |
 | `episodes` | `eval_id`、`init_index`、`success`、`max_progress`、`steps` | 逐回合结果，统计量全部由它现算 |
 | `jobs` | `id`、`kind`、`payload_json`、`status`、`progress`、`error`、`trace_id`、`token_id`、`created_at`、`updated_at` | 服务提交的任务 |
 | `tokens` | `id`、`name`、`hash`、`role`（`read` / `write`）、`created_at`、`revoked_at` | API 令牌，只存哈希 |
+| `ai_evals` | `id`、`suite`（`toolcall` / `task`）、`suite_fp`、`model`、`setup`、`seed`、`run_id`、`status` | 一次 AI 评测（表结构版本 2 加入）；`suite_fp` 到 `seed` 四个字段联合唯一 |
+| `ai_cases` | `eval_id`、`case_id`、`family`、`bucket`、`passed`、`scores_json`、`latency_ms`、`tokens_in`、`tokens_out`、`steps` | 逐用例结果，汇总由它现算 |
 
 一次评测的策略、仿真器、评测集必须属于同一个任务，写入时检查。
 
 排行榜、秩相关等汇总结果**不落表**，每次由 `episodes` 现算。这样统计方法改了不需要迁移数据，也不会出现汇总与明细不一致。
+AI 评测的汇总同样由 `ai_cases` 现算。
+
+**表结构迁移**：版本记在 `PRAGMA user_version` 里。版本 1 → 2 只新增 `ai_evals`、`ai_cases` 两张表，不动已有的表。
+打开版本 1 的库时，先用 `sqlite3` 的 backup 接口备份成 `roboarena.db.v1.bak`（库在 WAL 模式，直接复制文件不可靠），再迁移。
+已有工作区里的训练与评测结果不需要重建。微调得到的语言模型不进 `artifacts` 表：它的 `kind` 有取值约束，改约束要重建表；
+这类模型由训练运行的记录和配置里的 `[llm.models.<名称>]` 描述（第 16.5 节）。
 
 ### 6.3 检查点的完整性
 
@@ -389,6 +414,8 @@ n_exec = …
 ```
 
 用标准库 `tomllib` 读取。未知的键直接报错，避免拼错的配置项被悄悄忽略。
+已实现的配置段：`workspace`、`task`、`data`、`rollouts`、`policy`、`diffusion`、`zoo`、`eval`；`worldmodel` 在 M3 加入，
+应用层的 `llm`、`agent`、`aieval`、`tune` 见第 16 节。
 环境变量 `ROBOARENA_QUICK=1` 等价于选用 `quick.toml`。
 
 ## 8. 命令行
@@ -414,9 +441,15 @@ roboarena report                生成图表与结果表
 roboarena bench                 延迟基准
 roboarena serve                 启动服务
 roboarena token create|list|revoke    管理 API 令牌
-roboarena pipeline              按配置依次执行以上全部离线步骤
+roboarena llm list|ping         网关里配置的模型；逐个发一条最短的请求看通不通
+roboarena agent tools           Agent 可用的工具、参数与权限
+roboarena chat                  用自然语言操作平台（--once 文本；--resume 运行编号；--model 名称；--yes 预先同意需确认的操作）
+roboarena aieval run|report     在某个模型配置上跑一套用例；生成对比表
+roboarena tune corpus|train|export    生成微调语料；LoRA 微调；合并、量化并导入本机推理服务
+roboarena pipeline              按配置依次执行机器人一侧的全部离线步骤（不含应用层）
 ```
 
+已实现到 `eval leaderboard` 为止（`train worldmodel` 与 `eval run --sim <世界模型>` 属于 M3）；其余命令随各里程碑加入，见 PROGRESS。
 每个子命令都接受 `--config` 和若干 `--set 键=值` 覆盖。`pipeline` 是幂等的：已完成且输入指纹未变的步骤会跳过。
 
 ## 9. 服务
@@ -580,9 +613,14 @@ PushT 的全流程冒烟在本机手动跑。
 | 可观测性 | 日志与指标 | 响应头带追踪编号且与日志一致；请求后对应的计数增加 |
 | 前端 | 组件与数据逻辑 | 图表坐标计算、区间渲染、WebSocket 消息处理 |
 | 端到端 | 全流程 | 冒烟配置下 `pipeline` 跑通，报告文件生成（玩具任务进持续集成，PushT 在本机跑） |
+| 模型网关 | 适配器、重试、缓存、密钥 | 对假的 HTTP 传输核对请求与响应的映射；超时后重试、再降级；同样的请求第二次命中缓存；调用记录里没有密钥 |
+| Agent | 工具、循环、权限、结果校验 | 用脚本化假模型驱动：不合法的参数被拒绝并返回原因；未确认的删除不执行；编造的数字被校验器找出来；超出步数上限时停止 |
+| AI 评测 | 检查器本身 | 正确的记录判过；调错工具、参数错、编数字、未确认就删除的记录判不过；脚本化假模型的得分与预先算出的一致 |
+| 迁移 | 表结构升级 | 版本 1 的库升级后原有的行不变，`PRAGMA foreign_key_check` 无输出，备份文件存在 |
+| 微调 | 语料与训练 | 语料按组切分、与评测的留出部分不重合；在一个小批上过拟合（用随机初始化的极小模型，不下载权重） |
 | 架构 | 依赖方向 | 扫描导入语句，违反第 3 节的规则则失败；在 `tasks/pusht/` 以外搜到 `gym_pusht` 或 `coverage` 则失败 |
 
-测试默认在 CPU 上跑、不访问网络；需要人类演示的测试用一个随仓库提供的极小样本或标记为可跳过。
+测试默认在 CPU 上跑、不访问网络；需要人类演示的测试在没有缓存时跳过。应用层的测试不调用真实模型，也不依赖本机的推理服务。
 持续集成的作业划分见 10.1。
 
 ## 13. 依赖
@@ -591,12 +629,17 @@ PushT 的全流程冒烟在本机手动跑。
 | --- | --- |
 | `torch`、`numpy` | 模型与数值 |
 | `gym-pusht`（带 `gymnasium`、`pymunk`、`pygame-ce`） | 真实仿真器 |
-| `pyarrow`、`opencv-python-headless` | 读取演示数据的表格与视频；PNG 编码 |
+| `pyarrow`、`imageio[ffmpeg]` | 读取演示数据的表格与视频 |
+| `opencv-python-headless` | `gym-pusht` 渲染时用；PNG 编码（M5a） |
+| `httpx` | 模型网关调用 OpenAI 兼容接口（A1 加入）；也用于服务的接口测试 |
+| `transformers`、`peft`（可选依赖组 `tune`） | 领域小模型的 LoRA 微调（A3 加入）；核心安装不带 |
 | `matplotlib` | 报告里的图 |
 | `fastapi`、`uvicorn[standard]` | 服务与 WebSocket |
 | `prometheus-client` | 指标端点 |
-| 开发：`pytest`、`httpx`、`ruff`、`pyright` | 测试与检查 |
+| 开发：`pytest`、`ruff`、`pyright` | 测试与检查 |
 | 前端：`react`、`react-router`、`vite`、`typescript`、`vitest`、`openapi-typescript` | 页面、构建、测试、接口类型生成 |
+
+上表里已经装上的是前四行与开发依赖，其余在用到它的里程碑加入，版本按当时的稳定版确定并写进锁文件。
 
 `gym-pusht` 声明依赖 `pygame` 与带界面的 `opencv-python`。沿用课程仓库已验证的做法：
 在 `[tool.uv] override-dependencies` 里把这两个排除，改用 `pygame-ce` 与 headless 版 OpenCV。
@@ -623,10 +666,226 @@ PushT 的全流程冒烟在本机手动跑。
 | 指标 | Prometheus 文本端点 | 推送到某个监控平台 | 拉取式端点不绑定任何后端；本机用 `curl` 就能看 |
 | 配置 | dataclass + TOML | Hydra、OmegaConf | 标准库即可；未知键报错这一条自己写更可控 |
 | 包结构 | 可安装的 `src/` 布局 | 课程仓库式的脚本目录 | 独立软件，测试与服务需要正常导入 |
+| 应用层放在哪 | 同一个仓库、同一个包里的四个子包 | 另开仓库，通过 HTTP 把平台当工具后端 | 工具直接包装已有的函数，不必先做完服务；评测方法与运行记录可以共用。边界靠依赖方向的测试守住 |
+| 模型接入 | 自己写一层薄的网关，只认 OpenAI 兼容接口 | 直接用某个 Agent 框架 | 需要的只有对话与工具调用；自己写才能把每次调用记进运行记录、控制缓存与重试，评测也才说得清每个数字是怎么来的 |
+| Agent 的形态 | 单个 Agent 的「调用工具 → 看结果」循环 | 多 Agent 协作、图式工作流 | 平台的操作只有十来个，一个循环够用；多 Agent 会让失败难以归因 |
+| 需确认的操作 | 由代码按工具的权限档把关 | 在提示词里要求模型先问 | 提示词不是安全边界 |
+| 幻觉的判定 | 回答里的数字必须出自工具输出，程序检查 | 让另一个模型当裁判 | 可重复、无成本、判定本身可以写测试；代价是只管数字，不管文字性的错误（如实写明） |
+| Agent 评测的真值 | 平台函数在固定工作区上现算 | 人写参考答案 | 真值不会过期，也不会写错；玩具任务让它在 CPU 上几秒建好 |
+| 小模型的任务 | 指令 → 工具调用 | 通用问答 | 输出可以逐字段判对错，评测干净；也正是 Agent 里调用最频繁、最值得换成小模型的一环 |
+| 微调后的模型怎么登记 | 运行记录 + 配置里的一段 | 放进 `artifacts` 表 | 那张表的 `kind` 有取值约束，改它要重建表；不值得为此动已有的数据 |
 
 ## 15. 扩展点
 
 - **新策略**：实现 `Policy`，注册到 `policies` 的工厂表，训练后登记为 `artifact`。
 - **新世界模型后端**：实现 `WorldModel`，注册到 `worldmodel` 的工厂表。评测、服务、前端不需要改。
+- **新的语言模型**：服务提供 OpenAI 兼容接口的，只加一段 `[llm.models.<名称>]` 配置；否则在 `llm/` 里实现 `ChatModel`。
+- **新工具**：在 `agent/tools.py` 里声明参数的 dataclass、权限档和执行函数；AI 评测里补一族用例。
 - **新任务**：在 `tasks/` 下实现 `Task`（规格、初始状态采样、真实仿真器），注册名称。
   数据采集的行为策略（加噪回放、随机游走）里与任务相关的部分也放在任务插件里。评测、服务、前端不需要改。
+
+## 16. 大模型应用层
+
+v0.3 加入，对应需求 FR-L、FR-G、FR-V、FR-F。指标定义、用例分桶与止损阈值见 [PLAN.md](./PLAN.md)。
+本节是设计；实现随 A1–A3 推进，进度以 PROGRESS 为准。
+
+```
+用户的一句话 ─▶ Agent（规划与执行循环 ｜ 权限 ｜ 记忆 ｜ 结果校验）
+                  │ 工具调用                    │ 对话
+                  ▼                             ▼
+     平台已有的函数（评测、排行榜、       模型网关（路由 ｜ 重试降级 ｜ 缓存 ｜ 用量与成本 ｜ 调用记录）
+     训练、数据、运行记录）                 ├─ 本机的通用模型
+                  │                         ├─ 微调并量化后的小模型
+                  ▼                         └─ 脚本化假模型（测试用）
+     工作区（SQLite + 运行记录）◀── AI 评测：同一组用例 × 多个模型配置 → 逐用例结果入库 → 带区间的对比
+```
+
+### 16.1 模块与依赖
+
+| 单元 | 层级 | 职责 | 可以导入 |
+| --- | --- | --- | --- |
+| `llm` | 7 | 模型网关 | 只有 `core`、`config` |
+| `agent` | 8 | 工具、循环、权限、记忆、结果校验 | `llm` 与层级更低的单元 |
+| `aieval` | 9 | 用例、固定工作区、运行、打分 | 以上全部 |
+| `tune` | 10 | 语料、微调、导出 | 以上全部 |
+| `serve`、`cli` | 11 | | |
+
+`eval` 是 6，所以第 3 节图里的单元都导入不了应用层，`tests/test_architecture.py` 的层级检查原样适用。另加三条：
+
+- `llm` 只许导入 `core` 与 `config`（层级允许它导入更多，但网关不该知道平台的存在）。
+- `httpx` 只在 `llm/` 里导入；`transformers`、`peft` 只在 `tune/` 里导入，而且在函数内导入，不装可选依赖组时其余命令照常可用。
+- 四个单元都不出现某个任务专有的名字。
+
+### 16.2 模型网关（`llm/`）
+
+```python
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    parameters: dict  # JSON Schema
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict
+
+
+@dataclass(frozen=True)
+class Message:
+    role: str  # system / user / assistant / tool
+    content: str
+    tool_calls: tuple[ToolCall, ...] = ()  # 只有 assistant 消息会带
+    tool_call_id: str | None = None  # 只有 tool 消息会带：这是哪一次调用的结果
+
+
+@dataclass(frozen=True)
+class Completion:
+    text: str
+    tool_calls: tuple[ToolCall, ...]
+    tokens_in: int
+    tokens_out: int
+    latency_ms: float
+    cached: bool
+
+
+class ChatModel(Protocol):
+    name: str
+
+    def complete(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] = (),
+        *,
+        temperature: float = 0.0,
+        max_tokens: int = 512,
+        seed: int = 0,
+    ) -> Completion: ...
+```
+
+接口有两个使用者，所以现在就建：`openai_compat`（走 OpenAI 兼容的 HTTP 接口，Ollama、vLLM、SGLang、llama.cpp 的服务都提供）
+和 `scripted`（按预先写好的脚本作答，测试用，也用来给 AI 评测算「预先知道的得分」）。
+
+`Gateway` 在适配器外面包一层，Agent 与评测只和它打交道：
+
+- **路由**：按配置里的名称取模型。
+- **超时、重试、降级**：超时或服务端报错时重试 `retries` 次；仍失败且配置了 `fallback` 时改用备用模型，否则抛出一行中文报错。
+  模型输出解析不了（如工具调用的参数不是合法的 JSON）不算网关的错，原样交给上层处理。
+- **缓存**：键是（模型标识，消息，工具，采样参数，种子）的规范化 JSON 的 SHA-256，值放在 `cache/llm/`。
+  评测重跑时不重复花时间；测延迟时关闭。命中缓存的调用在记录里有标记，延迟不计入统计。
+- **调用记录**：每次调用往所属运行目录的 `llm_calls.jsonl` 追加一行：模型、耗时、输入与输出的 token 数、是否命中缓存、估算成本、请求的摘要。
+  密钥只从 `api_key_env` 指的环境变量读，不进配置快照、调用记录与日志。
+- **成本**：按配置里每百万 token 的价格估算。本机模型的价格是 0，这时报告的是延迟与 token 数，不把 0 元写成结论。
+
+```toml
+# 结构示意，具体数值在 A1 确定
+[llm]
+default = "qwen7b"          # chat 与 aieval 不指定模型时用它
+fallback = ""               # 默认模型重试后仍失败时改用它；空表示不降级
+timeout_s = 120
+retries = 2
+cache = true
+
+[llm.models.qwen7b]
+backend = "openai"
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen2.5:7b"
+api_key_env = ""            # 密钥所在的环境变量名；本机服务不需要
+price_in = 0.0              # 每百万 token 的价格
+price_out = 0.0
+```
+
+`[llm.models.<名称>]` 是「名称 → 表」的结构，现有的配置加载器不支持，A1 里扩展。
+
+### 16.3 Agent（`agent/`）
+
+```python
+@dataclass(frozen=True)
+class Tool:
+    name: str
+    description: str
+    args: type  # 参数用 dataclass 声明：由它生成 JSON Schema，也由它校验
+    access: Literal["read", "write", "confirm"]
+    run: Callable[[ToolContext, Any], dict]  # ToolContext 带工作区与配置；返回值是给模型看的观察
+```
+
+第一批工具，都是对已有函数的薄包装：
+
+| 工具 | 包装的函数 | 权限 |
+| --- | --- | --- |
+| `list_policies` | `store/registry.py::list_artifacts` | 只读 |
+| `leaderboard` | `eval/service.py::leaderboard` | 只读 |
+| `compare_policies` | 同上，加 `eval/stats.py`（区间是否重叠、配对检验） | 只读 |
+| `list_runs`、`get_run` | `runs` 表、`store/runs.py::read_metrics` | 只读 |
+| `dataset_info` | `data/dataset.py::load_dataset` | 只读 |
+| `describe_config` | `config.py`（键、类型、默认值、说明） | 只读 |
+| `check_overrides` | `config.py` 的覆盖项解析与校验（只校验，不执行） | 只读 |
+| `run_eval` | `eval/service.py::run_eval` | 可写 |
+| `train_policy` | `policies/train.py::train_policy` | 需确认（耗时） |
+| `remove_policy` | `store/registry.py::delete_artifact` | 需确认（不可恢复） |
+
+工具只接受名称与数值，不接受文件路径。`RoboArenaError` 不会让循环崩掉：它的那一行中文报错作为观察返回给模型。
+
+**循环**：模型 → 工具调用 → 校验参数 → 查权限 → 执行 → 把观察接在消息后面，直到模型给出不带工具调用的回答。
+步数、工具调用数、token、时间各有上限，超出时停止并如实说明停在哪一步。
+
+**权限**：三档与 FR-A2 的角色对应（只读令牌只能用只读工具）。「需确认」的工具在执行前由循环停下来问用户；
+`--yes` 表示预先同意。这一步在代码里，不在提示词里：模型说「用户已经同意了」不起作用。
+
+**结果校验**（`verify.py`，纯函数）：回答里的每个数字，必须能在本次会话的工具输出或用户输入里找到（允许百分比换算与四舍五入）。
+找不到的，把它们列给模型，允许重答一次；仍然找不到，回答照发但标明哪些数字没有出处。校验可以关掉，用来测它本身的作用。
+它只管数字，不管文字性的错误，这一点在报告里写明。
+
+**记忆**：一次对话是一条 `chat` 类型的运行记录，消息、工具调用与结果都存在运行目录里，`--resume <运行编号>` 接着聊。
+上下文超预算时，把较早的工具输出换成一行摘要（工具名、参数、结果的条数），原文仍在运行目录里。跨会话的备忘是 P1。
+
+### 16.4 AI 评测（`aieval/`）
+
+```python
+@dataclass(frozen=True)
+class Case:
+    id: str
+    family: str  # 用例族：一种意图，如「查某个策略的成功率」
+    bucket: str  # seen / heldout / handwritten，见 PLAN.md
+    group: str  # 同一条种子指令的各种说法同组，切分以组为单位
+    turns: tuple[str, ...]  # 用户的话；多轮用例有多条
+    gold_calls: tuple[ToolCall, ...] | None  # 单步用例的标准工具调用
+    check: str  # 检查器的名称
+```
+
+- **两套用例**：`toolcall`（单步：一句指令 → 一次工具调用，逐字段对答案）和 `task`（多步：检查最终回答里的事实、工作区的最终状态、
+  有没有多余的改动、需确认的操作有没有被擅自执行；含多轮指代与应当拒绝的用例）。
+- **固定工作区**：用玩具任务按冒烟配置建一次（数据集、评测集、策略库、评测结果），CPU 上几秒，不联网。
+  真值由平台函数在这个工作区上现算，不靠人写参考答案。会改动工作区的用例各拿一份副本，互不影响。
+  固定工作区里的名称（策略名、评测集名）与微调语料里的是两套，防止模型把名字背下来。
+- **存储**：一次评测是一条 `aieval` 类型的运行记录加 `ai_evals` 的一行，逐用例结果进 `ai_cases`，每个用例的完整对话留在运行目录里。
+  （用例集指纹，模型，配置，种子）相同的评测不重复记录。汇总（比例、Wilson 区间、配对检验）由明细现算。
+- **检查器先过自己的测试**：正确的记录必须判过，故意做错的必须判不过。
+
+### 16.5 领域小模型（`tune/`）
+
+目标：把「指令 → 工具调用」做进一个约 1.5B 参数的模型，量化后部署在本机，接回 Agent，和通用的大模型比效果、延迟、成本。
+
+```
+用例族的训练部分 × 模板 × 参数采样 ─▶ 标准工具调用 ─┐
+                                                    ├─▶ 语料（按组切分、清单、指纹、报告）─▶ LoRA 微调 ─▶ 合并 ─▶ 量化 ─▶ 本机推理服务
+教师模型改写指令 ─▶ 程序校验（槽位值对得上才留）────┘                                                                      │
+                                                                          AI 评测（同一套用例、同一套提示渲染与解析）◀──────┘
+```
+
+- **语料**（`corpus.py`）：做法照搬 `data/dataset.py`——按组切分、清单、指纹、`REPORT.md`。评测的留出模板与人工编写集不进语料，有测试。
+- **训练**（`train.py`）：`transformers` + `peft`，自己的训练循环，沿用运行记录、指标与学习率日程；只对助手的输出计损失。
+- **导出**（`export.py`）：合并适配器 → 量化 → 导入本机推理服务；记录体积、文件摘要、对应的训练运行，并打印要加进配置的 `[llm.models.<名称>]`。
+
+这台机器上的未知数，动手前先摸底（结果写进 PROGRESS 再定细节）：MPS 上 LoRA 的单步耗时、内存与半精度是否稳定；
+训练时的对话模板与推理服务用的模板渲染出来是否逐字相同（不同则训练与推理都用项目自己的渲染与解析，走补全接口）；
+微调后的权重进本机推理服务的具体路径；4 比特训练在 Apple 芯片上是否可用（待核对）。
+
+### 16.6 可复现性
+
+- AI 评测一律 temperature 0，种子写进请求并记入评测的键。本机推理服务在同一份量化权重上是否逐字可复现没有保证，
+  所以每次评测的原始回答都留在运行目录里，结论以留下的记录为准；重复运行之间的波动单独报告。
+- 缓存让同一次评测重跑时得到同样的回答，也意味着「重跑」不等于「重新采样」：要看波动时换种子或关缓存。
+- 微调沿用现有的规矩：全部随机性来自派生的发生器，训练留运行记录，语料有指纹。

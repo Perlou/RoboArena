@@ -5,14 +5,16 @@
 ## 这是什么
 
 RoboArena 是一个机器人策略评测平台：训练一个神经仿真器（动作条件的世界模型），在里面批量评估机器人策略，
-并检验这种评估和真实仿真器里的结果是否一致。它是「世界模型」课程 Phase 12 的结业项目，但作为**独立仓库**开发，
+并检验这种评估和真实仿真器里的结果是否一致。平台之上有一层大模型应用：用自然语言操作平台的 Agent、模型网关、AI 评测、
+领域小模型的微调与部署。它是「世界模型」课程 Phase 12 的结业项目，但作为**独立仓库**开发，
 不导入课程仓库（`../world-models-course`）的任何代码，也不要改动那个仓库。
 
 - 需求：[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)（需求编号 FR-* / NFR-*，里程碑，止损条件）
-- 架构：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（模块、接口、表结构、协议、设计决策）
+- 架构：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（模块、接口、表结构、协议、设计决策；应用层在第 16 节）
+- 实验计划：[docs/PLAN.md](docs/PLAN.md)（预注册的指标、用例分桶、预期方向、止损阈值；**实验之后不改定义**，要改写修订记录）
 - 进度：[docs/PROGRESS.md](docs/PROGRESS.md)（**以它为准**；完成一项就更新）
 
-动手之前先读这三份文档的相关部分。实现与文档不一致时，先指出来，改文档或改实现，不要让两者悄悄分叉。
+动手之前先读这几份文档的相关部分。实现与文档不一致时，先指出来，改文档或改实现，不要让两者悄悄分叉。
 
 ## 常用命令
 
@@ -34,28 +36,37 @@ src/roboarena/
   config.py   dataclass 配置 + TOML + 覆盖          （只依赖 core）
   store/      工作区：SQLite、运行记录、注册表       （只依赖 core）
   tasks/      任务与仿真器接口；各任务的实现
-  data/       回合文件、采集、校验、切分、指纹
+  data/       回合文件、采集、校验、切分、指纹、训练采样、策略回合集
   policies/   策略接口；行为克隆与 Diffusion Policy；训练循环；策略库
   worldmodel/ 世界模型接口与实现                    （M3）
   sim/        NeuralSim                             （M3）
-  eval/       评测器、统计、排行榜
+  eval/       评测器、统计、排行榜、策略回合的采集
+  llm/        模型网关：统一接口、适配器、重试降级、缓存、调用记录   （A1）
+  agent/      工具注册表、规划与执行循环、权限、记忆、结果校验       （A1 工具，A2 其余）
+  aieval/     AI 评测：用例、固定工作区、运行、打分                 （A1）
+  tune/       领域小模型：语料、LoRA 微调、导出与部署               （A3）
   serve/      FastAPI 服务                          （M5a）
   cli.py      命令行入口
 ```
 
-依赖只能从上层指向下层：`cli / serve → eval → policies / sim → worldmodel → data → tasks → store / config → core`。
+依赖只能从上层指向下层：`cli / serve → tune → aieval → agent → llm`，以及
+`agent → eval → policies / sim → worldmodel → data → tasks → store / config → core`。
 `tests/test_architecture.py` 会检查，违反即失败。另外几条硬规则：
 
 - 包内一律用绝对导入（`from roboarena.core...`）。
 - `policies` 与 `worldmodel` 互不导入；`sim` 不导入 `policies`。
-- `gym_pusht` 只在 `tasks/pusht/` 里导入；FastAPI 只在 `serve/` 里导入。
+- `gym_pusht` 只在 `tasks/pusht/` 里导入；FastAPI 只在 `serve/` 里导入；`httpx` 只在 `llm/` 里导入；
+  `transformers`、`peft` 只在 `tune/` 里导入，并且在函数内导入。
+- 机器人一侧（`tasks`、`data`、`policies`、`worldmodel`、`sim`、`eval`）不导入应用层（`llm`、`agent`、`aieval`、`tune`）。
+  `llm` 只导入 `core` 与 `config`。
 - `tasks/` 以外的代码不出现某个任务专有的名字（`coverage`、512、5 维状态）。通用的说法是 `progress`、`TaskSpec`。
 - 策略只看画面。接口边界上画面是 `uint8 [.., H, W, 3]`，动作是环境坐标；归一化是模型内部的事。
 
 ## 工作顺序
 
-里程碑按顺序做，一个做完再做下一个：M0 骨架 → M1 数据 → M2 策略库 → M3 神经仿真器 → M4 评测与秩相关 →
-M5a 服务 → M5b 前端 → M6 消融、报告、容器、持续集成。
+里程碑按顺序做，一个做完再做下一个：M0 骨架 → M1 数据 → M2 策略库（以上已完成）→ D1 文档 v0.3 → A1 模型网关与 AI 评测 →
+A2 Agent → A3 领域小模型 → M5a 服务 → M3 神经仿真器 → M4 评测与秩相关 → M5b 前端（P2）→ M6 消融、报告、容器、持续集成。
+2026-11-26 把应用层（D1、A1–A3）提到了 M3 之前，M3、M4 的内容不变。
 
 **M4 的秩相关数字出来之前，不建前端工程。** 止损条件见需求文档第 7 节。
 
@@ -67,15 +78,19 @@ M5a 服务 → M5b 前端 → M6 消融、报告、容器、持续集成。
 - **类型**：公开函数都有类型标注；张量形状写在注释里，如 `[B, T, H, W, 3]`。
 - **数值**：张量一律 float32（MPS 不支持 float64）；设备用 `roboarena.core.device.get_device()`。
 - **随机数**：不用全局随机状态。每个组件用 `derive_seed(全局种子, 组件名)` 派生自己的发生器。
-- **测试**：新功能带测试。统计函数对手算例子；任务插件过 `tests/test_tasks.py` 的契约测试。测试不联网、默认跑 CPU。
+- **测试**：新功能带测试。统计函数对手算例子；任务插件过 `tests/test_tasks.py` 的契约测试。测试不联网、默认跑 CPU，
+  不调用真实的语言模型（用脚本化假模型），也不依赖本机的推理服务。AI 评测的检查器先过自己的测试。
 - **依赖**：只加当前里程碑实际用到的包。
-- **安全**：加载检查点用 `torch.load(..., weights_only=True)`；接口不接受文件路径；令牌不进日志。
+- **安全**：加载检查点用 `torch.load(..., weights_only=True)`；接口与 Agent 的工具不接受文件路径；令牌不进日志；
+  模型服务的密钥只从环境变量读，不进配置文件、配置快照、调用记录与日志；需确认的操作由代码把关，不靠提示词。
+- **表结构**：改表要写迁移并递增 `SCHEMA_VERSION`，只新增、不改已有的表；现有 `workspace/` 里的结果不能要求重建。
 - **不提前抽象**：只为已经有两个使用者的东西建接口。
 
 ## 事实与数字
 
 - 报告、README、文档里的**实验数字只写真实跑出来的**。没跑的地方写 `> 📌 待回填：<要填什么，来自哪条命令>`。
 - 目标值和实测值分开写，不要把目标写成结果。
+- 应用层的指标按 `docs/PLAN.md` 的定义算；三个桶分开报告；模型之间用配对检验比较。
 - 负结果照实写。
 - 论文引用写成「作者 年份（arXiv:编号）」；编号没核对过的标「（待核对）」。
 
@@ -87,7 +102,8 @@ M5a 服务 → M5b 前端 → M6 消融、报告、容器、持续集成。
 - PushT 人类演示第一次用到时下载到 `workspace/cache/pusht/raw/`（约 8 MB）。访问不了 huggingface.co 时设
   `HF_ENDPOINT=https://hf-mirror.com`。依赖演示数据的测试在没有缓存时自动跳过。
 - `gym-pusht` 的一个坑：`reset_to_state` 设定朝向时块的位置会偏移，传入的块坐标不等于重置后读到的位姿。
-- `workspace/` 是运行产物，不入库。
+- `workspace/` 是运行产物，不入库。里面现有 17 个策略的训练与评测结果（约两小时），不要删。
+- 本机装有 Ollama（应用层的实跑评测要它的服务在运行）。微调相关的依赖在可选依赖组 `tune` 里，A3 时加入。
 
 ## 不要做的事
 
@@ -95,3 +111,4 @@ M5a 服务 → M5b 前端 → M6 消融、报告、容器、持续集成。
 - 不要写没跑过的实验数字。
 - 不要改动 `../world-models-course`。
 - 不要并行派发子代理同时做多个里程碑。
+- 不要在看到实验结果之后改 `docs/PLAN.md` 里的指标定义与分桶；确实要改，写进它的修订记录。

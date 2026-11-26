@@ -516,3 +516,31 @@ def test_cli_zoo_flow(tmp_path, capsys):
     code, out, _ = run("policy", "remove", "--name", "bc-demos2")
     assert code == 0 and "1 次评测结果" in out
     assert run("policy", "remove", "--name", "bc-demos2")[0] == 1
+
+
+def test_rollouts_leave_a_run_record(ws_data, cfg):
+    """采集策略回合也是一次运行：配置、种子、用了哪些策略的哪份权重，事后都查得到。"""
+    from roboarena.store.registry import register_artifact
+
+    register_artifact(ws_data, task="toy", name="random", kind="policy", backend="random", params={})
+    cfg.rollouts.per_policy = 3
+    summary = collect_rollouts(ws_data, cfg)
+    run = ws_data.db.execute("SELECT kind, status FROM runs WHERE id = ?", (summary.run_id,)).fetchone()
+    assert (run["kind"], run["status"]) == ("data", "done")
+    meta = json.loads((ws_data.root / "runs" / summary.run_id / "meta.json").read_text())
+    assert meta["rollouts"] == "toy/zoo"
+    assert meta["policies"] == {"random": get_artifact(ws_data, "random").sha256}
+    assert meta["per_policy"]["random"][0] == 3
+
+
+def test_rollouts_with_a_wrong_task_policy_leave_no_run(ws_data, cfg):
+    """前提不满足时直接报错，不留下一条失败的运行记录。"""
+    from roboarena.core.errors import RoboArenaError
+    from roboarena.store.registry import register_artifact
+
+    register_artifact(ws_data, task="pusht", name="other", kind="policy", backend="random", params={})
+    cfg.rollouts.policies = ["other"]
+    before = ws_data.db.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    with pytest.raises(RoboArenaError, match="属于任务 pusht"):
+        collect_rollouts(ws_data, cfg)
+    assert ws_data.db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == before

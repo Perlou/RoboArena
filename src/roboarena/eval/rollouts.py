@@ -20,6 +20,7 @@ from roboarena.eval.runner import evaluate
 from roboarena.policies import build_policy
 from roboarena.policies.api import Policy
 from roboarena.store.registry import checkpoint_path, get_artifact, list_artifacts
+from roboarena.store.runs import start_run
 from roboarena.store.workspace import Workspace
 from roboarena.tasks import get_task
 from roboarena.tasks.api import Episode, InitState, StepResult, Task
@@ -31,6 +32,7 @@ log = get_logger(__name__)
 class RolloutSummary:
     dir: Path
     per_policy: dict[str, tuple[int, int, int]]  # 策略 → (回合数, 成功的回合数, 帧数)
+    run_id: str  # 这次采集的运行记录
 
 
 def record_episodes(
@@ -75,41 +77,54 @@ def record_episodes(
 
 
 def collect_rollouts(ws: Workspace, cfg: Config) -> RolloutSummary:
-    """按 cfg.rollouts 采集并保存一个策略回合集。初始状态的种子按（回合集名，策略名）派生，与评测集不相交。"""
+    """按 cfg.rollouts 采集并保存一个策略回合集，留下一条运行记录（用了哪些策略的哪份权重都记在里面）。
+
+    初始状态的种子按（回合集名，策略名）派生，与评测集不相交。
+    """
     rc = cfg.rollouts
     task = get_task(cfg.task.name)
     spec = task.spec
     names = rc.policies or [a.name for a in list_artifacts(ws, task=spec.name, kind="policy")]
     if not names:
         raise RoboArenaError(f"任务 {spec.name} 还没有登记任何策略")
+    artifacts = [get_artifact(ws, name, kind="policy") for name in names]
+    for artifact in artifacts:  # 前提在开始运行之前查完：不满足时直接报错，不留下一条失败的运行记录
+        if artifact.task != spec.name:
+            raise RoboArenaError(f"策略 {artifact.name} 属于任务 {artifact.task}，当前任务是 {spec.name}")
     max_steps = cfg.eval.max_steps or spec.max_steps
 
-    episodes: list[Episode] = []
-    per_policy: dict[str, tuple[int, int, int]] = {}
-    for name in names:
-        artifact = get_artifact(ws, name, kind="policy")
-        if artifact.task != spec.name:
-            raise RoboArenaError(f"策略 {name} 属于任务 {artifact.task}，当前任务是 {spec.name}")
-        policy = build_policy(artifact.backend, spec, artifact.params, checkpoint_path(ws, artifact), name)
-        inits = task.sample_inits(rc.per_policy, derive_seed(cfg.seed, f"rollouts:{rc.name}:{name}:inits"))
-        mine: list[Episode] = []
-        for start in range(0, len(inits), cfg.eval.batch):
-            mine += record_episodes(
-                task,
-                policy,
-                inits[start : start + cfg.eval.batch],
-                max_steps=max_steps,
-                n_exec=min(cfg.eval.n_exec, policy.chunk),
-                extra_steps=rc.extra_steps,
-                rng=make_rng(cfg.seed, f"rollouts:{rc.name}:{name}:{start}"),
+    with start_run(ws, "data", config=cfg.to_dict(), config_toml=cfg.to_toml(), seed=cfg.seed) as run:
+        run.update_meta(rollouts=f"{spec.name}/{rc.name}", policies={a.name: a.sha256 for a in artifacts})
+        episodes: list[Episode] = []
+        per_policy: dict[str, tuple[int, int, int]] = {}
+        for artifact in artifacts:
+            name = artifact.name
+            policy = build_policy(
+                artifact.backend, spec, artifact.params, checkpoint_path(ws, artifact), name
             )
-        for i, ep in enumerate(mine):
-            ep.meta.update(index=i, group=f"policy-{name}-{i}")
-        per_policy[name] = (
-            len(mine),
-            sum(bool(e.success.any()) for e in mine),
-            sum(len(e) + 1 for e in mine),
-        )
-        episodes += mine
-        log.info("策略回合采集完成", extra={"policy": name, "episodes": len(mine)})
-    return RolloutSummary(save_rollout_set(ws.root, spec.name, rc.name, episodes), per_policy)
+            inits = task.sample_inits(
+                rc.per_policy, derive_seed(cfg.seed, f"rollouts:{rc.name}:{name}:inits")
+            )
+            mine: list[Episode] = []
+            for start in range(0, len(inits), cfg.eval.batch):
+                mine += record_episodes(
+                    task,
+                    policy,
+                    inits[start : start + cfg.eval.batch],
+                    max_steps=max_steps,
+                    n_exec=min(cfg.eval.n_exec, policy.chunk),
+                    extra_steps=rc.extra_steps,
+                    rng=make_rng(cfg.seed, f"rollouts:{rc.name}:{name}:{start}"),
+                )
+            for i, ep in enumerate(mine):
+                ep.meta.update(index=i, group=f"policy-{name}-{i}")
+            per_policy[name] = (
+                len(mine),
+                sum(bool(e.success.any()) for e in mine),
+                sum(len(e) + 1 for e in mine),
+            )
+            episodes += mine
+            log.info("策略回合采集完成", extra={"policy": name, "episodes": len(mine)})
+        out = save_rollout_set(ws.root, spec.name, rc.name, episodes)
+        run.update_meta(per_policy=per_policy)
+    return RolloutSummary(out, per_policy, run.id)
