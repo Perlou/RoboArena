@@ -157,3 +157,95 @@ def test_eval_key_is_unique_and_episodes_cascade(ws):
 
     eval_store.delete_eval(ws, eval_id)
     assert eval_store.episodes_of(ws, eval_id) == []
+
+
+# ---- 表结构迁移 ----
+
+from roboarena.store import db as dbmod  # noqa: E402
+
+
+def _tables(conn) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+
+def _old_db(path, version=1):
+    """一个版本 1 的库，里面有一条运行记录。"""
+    conn = sqlite3.connect(path)
+    conn.executescript(dbmod.SCHEMA)
+    conn.execute(
+        "INSERT INTO runs (id, kind, status, config_json, started_at) VALUES ('r1', 'eval', 'done', '{}', 't')"
+    )
+    conn.execute(f"PRAGMA user_version = {version}")
+    conn.commit()
+    conn.close()
+
+
+def test_new_database_is_at_the_current_version_without_a_backup(tmp_path):
+    conn = dbmod.connect(tmp_path / "a.db")
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == dbmod.SCHEMA_VERSION == 2
+    assert {"ai_evals", "ai_cases", "runs", "episodes"} <= _tables(conn)
+    conn.close()
+    assert sorted(p.name for p in tmp_path.iterdir() if p.suffix == ".bak") == []
+
+
+def test_version_1_database_is_backed_up_then_migrated(tmp_path):
+    path = tmp_path / "a.db"
+    _old_db(path)
+
+    conn = dbmod.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert {"ai_evals", "ai_cases"} <= _tables(conn)
+    assert conn.execute("SELECT id FROM runs").fetchall()[0]["id"] == "r1"  # 原有的数据还在
+    conn.execute(
+        "INSERT INTO runs (id, kind, status, config_json, started_at) VALUES ('r2', 'chat', 'done', '{}', 't')"
+    )
+    conn.commit()  # 迁移之后连接照常使用
+    conn.close()
+
+    backup = sqlite3.connect(tmp_path / "a.db.v1.bak")
+    assert backup.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert "ai_evals" not in _tables(backup)
+    assert [r[0] for r in backup.execute("SELECT id FROM runs")] == ["r1"]
+    backup.close()
+
+    dbmod.connect(path).close()  # 再打开一次：不再迁移，也不动备份
+    assert [p.name for p in tmp_path.glob("*.bak*")] == ["a.db.v1.bak"]
+
+
+def test_failed_migration_leaves_the_old_version(tmp_path, monkeypatch):
+    path = tmp_path / "a.db"
+    _old_db(path)
+    monkeypatch.setitem(
+        dbmod.MIGRATIONS, 2, "CREATE TABLE ai_evals (id INTEGER); CREATE TABLE runs (id INTEGER);"
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        dbmod.connect(path)
+
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert "ai_evals" not in _tables(conn)  # 前一半建的表也撤销了
+    conn.close()
+    assert (tmp_path / "a.db.v1.bak").exists()
+
+    monkeypatch.undo()
+    conn = dbmod.connect(path)  # 修好之后重来：能迁移，早先的备份留着
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    conn.close()
+
+
+def test_database_from_a_newer_program_is_refused(tmp_path):
+    path = tmp_path / "a.db"
+    _old_db(path, version=99)
+    with pytest.raises(RuntimeError, match="表结构版本是 99，比本程序认识的 2 新"):
+        dbmod.connect(path)
+
+
+def test_ai_eval_key_is_unique_and_cases_cascade(ws):
+    insert = "INSERT INTO ai_evals (suite, suite_fp, model, setup, seed, status) VALUES ('toolcall', 'fp', 'm', 's', ?, 'done')"
+    eval_id = ws.db.execute(insert, (0,)).lastrowid
+    ws.db.execute(insert, (1,))
+    with pytest.raises(sqlite3.IntegrityError):
+        ws.db.execute(insert, (0,))
+    ws.db.execute("INSERT INTO ai_cases VALUES (?, 'c1', 'f', 'seen', 1, '{}', 1.5, 10, 2, 1)", (eval_id,))
+    ws.db.execute("DELETE FROM ai_evals WHERE id = ?", (eval_id,))
+    assert ws.db.execute("SELECT COUNT(*) FROM ai_cases").fetchone()[0] == 0

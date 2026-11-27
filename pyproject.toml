@@ -14,6 +14,7 @@ dependencies = [
     # 读取 LeRobot 格式的人类演示（parquet + mp4），不安装 lerobot 本体
     "pyarrow>=18",
     "imageio[ffmpeg]>=2.34",
+    "httpx>=0.29.0",
 ]
 
 [project.scripts]

@@ -90,3 +90,51 @@ def test_quick_env_selects_quick_config(monkeypatch):
     assert load_config().task.name == "toy"
     monkeypatch.setenv("ROBOARENA_QUICK", "0")
     assert load_config().task.name == "pusht"
+
+
+def test_llm_models_are_a_table_of_tables(tmp_path):
+    path = tmp_path / "c.toml"
+    path.write_text(
+        '[llm]\ndefault = "big"\nfallback = "small"\nretries = 0\n'
+        '[llm.models.big]\nbase_url = "http://127.0.0.1:1/v1"\nmodel = "m-big"\nprice_in = 2\n'
+        '[llm.models.small]\nbase_url = "http://127.0.0.1:1/v1"\nmodel = "m-small"\n'
+    )
+    cfg = load_config(path, ['llm.models.small.model="m-tiny"', 'llm.models.extra.model="m-x"'])
+    assert (cfg.llm.default, cfg.llm.fallback, cfg.llm.retries) == ("big", "small", 0)
+    assert cfg.llm.models["big"].model == "m-big" and cfg.llm.models["big"].price_in == 2.0
+    assert cfg.llm.models["small"].model == "m-tiny"  # 覆盖项只改提到的那一项
+    assert cfg.llm.models["small"].base_url == "http://127.0.0.1:1/v1"
+    assert cfg.llm.models["extra"].backend == "openai"  # 新名称用默认值补齐
+
+    again = Config()
+    from roboarena.config import _apply
+
+    _apply(again, tomllib.loads(cfg.to_toml()))
+    assert again == cfg
+
+
+def test_default_llm_models_point_at_the_local_server():
+    llm = Config().llm
+    assert llm.default in llm.models and llm.fallback == ""
+    assert all(
+        m.base_url.startswith("http://127.0.0.1:") and m.api_key_env == "" for m in llm.models.values()
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (['llm.default="nope"'], "llm.default 指的模型 nope 没有在 llm.models 里定义"),
+        (['llm.fallback="nope"'], "llm.fallback 指的模型 nope 没有在 llm.models 里定义"),
+        (["llm.models.big.modle=1"], "未知的配置项：llm.models.big.modle"),
+        (["llm.models.big=3"], "llm.models.big 应为一个表"),
+        (["llm.models=3"], "llm.models 应为一个表"),
+        (['llm.models.big.backend="grpc"'], "llm.models.big.backend 应为 openai"),
+        (["llm.retries=-1"], "llm.retries 不能是负数"),
+        (["llm.timeout_s=0"], "llm.timeout_s 应大于 0"),
+        (['llm.models.a:b.model="x"'], "llm.models 里的名称 a:b 只能由字母、数字、下划线、连字符组成"),
+    ],
+)
+def test_bad_llm_settings_are_rejected(overrides, message):
+    with pytest.raises(ConfigError, match=message):
+        load_config(overrides=overrides)

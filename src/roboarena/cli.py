@@ -8,13 +8,17 @@ import sys
 from collections.abc import Callable, Sequence
 
 from roboarena import __version__
-from roboarena.config import Config, load_config
+from roboarena.aieval.cases import BUCKETS, toolcall_cases
+from roboarena.aieval.report import render_report as render_ai_report
+from roboarena.aieval.run import TOOLCALL, run_toolcall
+from roboarena.config import Config, load_config, with_overrides
 from roboarena.core.device import get_device, is_quick
 from roboarena.core.errors import RoboArenaError
 from roboarena.core.log import setup_logging
 from roboarena.data.dataset import build_dataset, load_dataset, render_report, verify_dataset
 from roboarena.eval import service
 from roboarena.eval.rollouts import collect_rollouts
+from roboarena.llm.gateway import Gateway
 from roboarena.policies import list_policy_backends
 from roboarena.policies.train import train_policy
 from roboarena.policies.zoo import build_zoo
@@ -222,6 +226,33 @@ def cmd_runs_list(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_aieval_run(cfg: Config, args: argparse.Namespace) -> int:
+    cases = toolcall_cases()
+    if args.bucket:
+        cases = [c for c in cases if c.bucket in args.bucket]
+    if args.limit:
+        cases = cases[:: max(1, len(cases) // args.limit)][: args.limit]  # 等间隔抽，各个族都抽到
+    models = args.model or [cfg.llm.default]
+    cfg = with_overrides(cfg, ['llm.fallback=""'])  # 评测不降级：降级之后记下来的就不是这个模型的回答了
+    with Workspace(cfg.workspace.root) as ws:
+        gateway = Gateway(cfg.llm, cache_dir=ws.root / "cache" / "llm")
+        for model in models:
+            for seed in args.seeds:
+                out = run_toolcall(ws, cfg, gateway, model, cases, seed=seed, force=args.force)
+                note = "（库里已有结果，未重跑）" if out.skipped else ""
+                print(
+                    f"{out.model} 种子 {out.seed}：合法 {out.valid}/{out.n}，完全匹配 {out.matched}/{out.n}{note}",
+                    flush=True,
+                )
+    return 0
+
+
+def cmd_aieval_report(cfg: Config, args: argparse.Namespace) -> int:
+    with Workspace(cfg.workspace.root) as ws:
+        print(render_ai_report(ws, args.suite), end="")
+    return 0
+
+
 def cmd_planned(cfg: Config, args: argparse.Namespace) -> int:
     print(f"命令 {args.command} 尚未实现，计划在 {PLANNED[args.command]} 完成。", file=sys.stderr)
     return 2
@@ -290,6 +321,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="已有结果时删掉重跑")
     p = leaf(ev, "leaderboard", "排行榜：成功率与 Wilson 区间", cmd_eval_leaderboard)
     p.add_argument("--sim", default=service.REAL)
+
+    ai = group("aieval", "AI 评测：语言模型会不会操作这个平台")
+    p = leaf(ai, "run", "在单步的工具调用用例上评测一个或多个模型，结果入库", cmd_aieval_run)
+    p.add_argument(
+        "--model", nargs="+", metavar="名称", help="配置里 [llm.models] 下的名称；省略时用 llm.default"
+    )
+    p.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2], metavar="种子")
+    p.add_argument("--bucket", nargs="+", choices=BUCKETS, help="只跑这些桶")
+    p.add_argument(
+        "--limit", type=int, default=0, help="只跑这么多条（等间隔抽），试跑用；用例集的指纹会不同"
+    )
+    p.add_argument("--force", action="store_true", help="已有结果时删掉重跑")
+    p = leaf(ai, "report", "由结果库生成对比报告（Markdown）", cmd_aieval_report)
+    p.add_argument("--suite", default=TOOLCALL, choices=[TOOLCALL])
 
     p = leaf(group("runs", "运行记录"), "list", "最近的运行", cmd_runs_list)
     p.add_argument("--limit", type=int, default=20)

@@ -4,7 +4,7 @@ import pytest
 from roboarena.core.errors import NotFoundError, RoboArenaError
 from roboarena.eval import service
 from roboarena.eval.runner import evaluate
-from roboarena.eval.stats import wilson_interval
+from roboarena.eval.stats import mcnemar_exact, wilson_interval
 from roboarena.store.registry import register_artifact
 from roboarena.store.workspace import Workspace
 from roboarena.tasks import get_task
@@ -27,6 +27,14 @@ def test_wilson_hand_computed():
     assert high == 1.0 and low == pytest.approx(1 - 0.2775, abs=1e-4)
 
 
+def test_wilson_accepts_a_fractional_success_count():
+    # 5.5/11，即 p = 0.5、n = 11：中心 0.5，半宽 = 1.96·sqrt(0.25/11 + 3.8415/484) / (1 + 3.8415/11) = 0.2544
+    low, high = wilson_interval(5.5, 11)
+    assert low == pytest.approx(0.2456, abs=1e-4) and high == pytest.approx(0.7544, abs=1e-4)
+    # 比例与样本量相同就是同一个区间：7.5/15 = 0.5，n = 15 与整数的情形走同一条公式
+    assert wilson_interval(4.0, 8) == wilson_interval(4, 8)
+
+
 def test_wilson_edge_cases():
     assert wilson_interval(0, 0) == (0.0, 1.0)
     narrow, wide = wilson_interval(50, 100), wilson_interval(5, 10)
@@ -35,6 +43,29 @@ def test_wilson_edge_cases():
     assert loose[1] - loose[0] < wide[1] - wide[0]
     with pytest.raises(ValueError):
         wilson_interval(11, 10)
+
+
+# ---- McNemar 精确检验：对手算例子 ----
+
+
+def test_mcnemar_hand_computed():
+    # 8 对 2，n = 10：P(X ≤ 2) = (1 + 10 + 45) / 1024 = 56/1024，双侧 p = 112/1024 = 0.109375
+    assert mcnemar_exact(8, 2) == pytest.approx(0.109375)
+    assert mcnemar_exact(2, 8) == pytest.approx(0.109375)  # 与方向无关
+    # 5 对 0，n = 5：P(X ≤ 0) = 1/32，p = 2/32 = 0.0625。五个用例全朝一边也到不了 0.05
+    assert mcnemar_exact(5, 0) == pytest.approx(0.0625)
+    # 6 对 0：p = 2/64 = 0.03125
+    assert mcnemar_exact(0, 6) == pytest.approx(0.03125)
+    # 1 对 0：p = 2 · 1/2 = 1
+    assert mcnemar_exact(1, 0) == 1.0
+
+
+def test_mcnemar_edge_cases():
+    assert mcnemar_exact(0, 0) == 1.0  # 没有不一致的用例：什么也说明不了
+    assert mcnemar_exact(3, 3) == 1.0  # 两边相等时双侧概率超过 1，截到 1
+    assert mcnemar_exact(40, 10) < mcnemar_exact(8, 2)  # 同样的比例，用例越多越显著
+    with pytest.raises(ValueError):
+        mcnemar_exact(-1, 2)
 
 
 # ---- 评测循环：用可以预先算出结果的假仿真器与假策略 ----

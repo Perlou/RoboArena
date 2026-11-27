@@ -19,3 +19,18 @@ class ConflictError(RoboArenaError):
 
 class IntegrityError(RoboArenaError):
     """文件内容与登记的哈希不一致。"""
+
+
+class ModelError(RoboArenaError):
+    """语言模型的服务调用失败：连不上、超时、服务端报错，或脚本化假模型的脚本用完了。
+
+    retryable 表示再试一次可能成功（超时、连不上、服务端 5xx、限流）；请求本身有错时为 False。
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class ToolError(RoboArenaError):
+    """Agent 的工具调用不成立：工具不存在、参数没通过校验，或没有得到许可。"""

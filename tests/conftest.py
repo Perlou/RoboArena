@@ -65,3 +65,20 @@ def ws(tmp_path: Path) -> Iterator[Workspace]:
 @pytest.fixture
 def cfg(tmp_path: Path) -> Config:
     return load_config(QUICK, [f'workspace.root="{tmp_path / "ws"}"'])
+
+
+@pytest.fixture(scope="session")
+def fixture_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """AI 评测的固定工作区，整个测试会话只建一次（几秒）。只读；要改动的测试用 fixture_copy。"""
+    from roboarena.aieval.fixture import ensure_fixture
+
+    return ensure_fixture(tmp_path_factory.mktemp("aieval"))
+
+
+@pytest.fixture
+def fixture_copy(fixture_root: Path, tmp_path: Path) -> Iterator[tuple[Workspace, Config]]:
+    from roboarena.aieval.fixture import copy_fixture
+
+    copied = copy_fixture(fixture_root, tmp_path / "fixture")
+    with Workspace(tmp_path / "fixture") as workspace:
+        yield workspace, copied
