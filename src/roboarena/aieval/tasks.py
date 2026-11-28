@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -20,7 +20,7 @@ from roboarena.agent.verify import says
 from roboarena.aieval import fixture
 from roboarena.aieval.check import canonical_call
 from roboarena.config import with_overrides
-from roboarena.core.errors import ToolError
+from roboarena.core.errors import RoboArenaError, ToolError
 from roboarena.core.hashing import canonical_json, sha256_text
 from roboarena.data.dataset import load_dataset
 from roboarena.eval import service
@@ -81,6 +81,10 @@ def snapshot(ctx: ToolContext) -> Snapshot:
 # ---- 事实 ----
 
 
+class _MissingFact(ValueError):
+    """工作区里缺少算出这条事实所需的结果（如该跑的评测没跑、策略被删）。"""
+
+
 def _board(ctx: ToolContext, suite: str) -> list[service.LeaderboardRow]:
     return service.leaderboard(ctx.ws, with_overrides(ctx.cfg, [f'eval.suite="{suite}"']))
 
@@ -89,13 +93,13 @@ def _row(ctx: ToolContext, policy: str, suite: str) -> service.LeaderboardRow:
     for row in _board(ctx, suite):
         if row.policy == policy:
             return row
-    raise ValueError(f"策略 {policy} 在评测集 {suite} 上没有评测结果")
+    raise _MissingFact(f"策略 {policy} 在评测集 {suite} 上没有评测结果")
 
 
 def _top(ctx: ToolContext, suite: str) -> list[service.LeaderboardRow]:
     board = _board(ctx, suite)
     if not board:
-        raise ValueError(f"评测集 {suite} 上没有评测结果")
+        raise _MissingFact(f"评测集 {suite} 上没有评测结果")
     return [r for r in board if r.rate == board[0].rate]
 
 
@@ -116,7 +120,7 @@ def resolve(ctx: ToolContext, fact: Fact) -> float | frozenset[str]:
         case ("rate_of_top", source, suite):  # source 上排第一的那个策略，在 suite 上的成功率
             leaders = _top(ctx, source)
             if len(leaders) != 1:
-                raise ValueError(f"评测集 {source} 上并列第一的有 {len(leaders)} 个，指代不唯一")
+                raise _MissingFact(f"评测集 {source} 上并列第一的有 {len(leaders)} 个，指代不唯一")
             return _row(ctx, leaders[0].policy, suite).rate
         case ("n_policies",):
             return float(len(list_artifacts(ctx.ws, task=task, kind="policy")))
@@ -135,8 +139,10 @@ def resolve(ctx: ToolContext, fact: Fact) -> float | frozenset[str]:
                 "SELECT id FROM runs WHERE kind = ? ORDER BY started_at DESC, id DESC LIMIT 1", (kind,)
             ).fetchone()
             if row is None:
-                raise ValueError(f"没有类型为 {kind} 的运行")
+                raise _MissingFact(f"没有类型为 {kind} 的运行")
             meta = json.loads((ctx.ws.root / "runs" / row["id"] / "meta.json").read_text(encoding="utf-8"))
+            if "policy" not in meta:
+                raise _MissingFact(f"运行 {row['id']} 没有记录策略名称")
             return frozenset({meta["policy"]})
     raise ValueError(f"不认识的事实：{fact}")
 
@@ -156,7 +162,7 @@ _FACT_ZH = {
 # ---- 检查器 ----
 
 
-def _differences(label: str, parts: Sequence[tuple[str, Sequence[str]]]) -> list[str]:
+def _differences(label: str, parts: Sequence[tuple[str, Collection[str]]]) -> list[str]:
     found = [f"{what} {'、'.join(sorted(names))}" for what, names in parts if names]
     return [f"{label}与预期不符：{'；'.join(found)}"] if found else []
 
@@ -227,7 +233,11 @@ def check_task(case: TaskCase, ctx: ToolContext, before: Snapshot, turns: Sequen
 
     # 最终回答里的事实
     for fact in case.facts:
-        truth = resolve(ctx, fact)
+        try:
+            truth = resolve(ctx, fact)
+        except (_MissingFact, RoboArenaError) as exc:
+            reasons.append(f"无法核对事实：{exc}")
+            continue
         if isinstance(truth, frozenset):
             if not any(name in last for name in truth):
                 reasons.append(f"回答里没有提到 {'、'.join(sorted(truth))}")

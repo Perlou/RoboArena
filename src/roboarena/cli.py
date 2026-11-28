@@ -15,7 +15,9 @@ from roboarena.agent.loop import ToolEvent, Turn
 from roboarena.agent.tools import ACCESS_ZH, TOOLS, Tool
 from roboarena.aieval.cases import BUCKETS, toolcall_cases
 from roboarena.aieval.report import render_report as render_ai_report
-from roboarena.aieval.run import TOOLCALL, run_toolcall
+from roboarena.aieval.run import SUITES as AI_SUITES
+from roboarena.aieval.run import TASK, TOOLCALL, run_task, run_toolcall
+from roboarena.aieval.tasks import task_cases
 from roboarena.config import Config, load_config, with_overrides
 from roboarena.core.device import get_device, is_quick
 from roboarena.core.errors import RoboArenaError
@@ -344,13 +346,32 @@ def cmd_chat(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_aieval_run(cfg: Config, args: argparse.Namespace) -> int:
+    models = args.model or [cfg.llm.default]
+    cfg = with_overrides(cfg, ['llm.fallback=""'])  # 评测不降级：降级之后记下来的就不是这个模型的回答了
+    if args.suite == TASK:
+        if args.bucket:
+            raise RoboArenaError("task 套件不分桶，不能指定 --bucket")
+        tcases = task_cases()
+        if args.limit:
+            tcases = tcases[:: max(1, len(tcases) // args.limit)][: args.limit]
+        with Workspace(cfg.workspace.root) as ws:
+            gateway = make_gateway(cfg, ws)
+            for model in models:
+                for seed in args.seeds:
+                    out = run_task(ws, cfg, gateway, model, tcases, seed=seed, force=args.force)
+                    note = "（库里已有结果，未重跑）" if out.skipped else ""
+                    print(
+                        f"{out.model}（{out.setup}）种子 {out.seed}：完成 {out.passed}/{out.n}，"
+                        f"含幻觉回答 {out.hallucinated_answers}/{out.answers}，越权 {out.violations}{note}",
+                        flush=True,
+                    )
+        return 0
+
     cases = toolcall_cases()
     if args.bucket:
         cases = [c for c in cases if c.bucket in args.bucket]
     if args.limit:
         cases = cases[:: max(1, len(cases) // args.limit)][: args.limit]  # 等间隔抽，各个族都抽到
-    models = args.model or [cfg.llm.default]
-    cfg = with_overrides(cfg, ['llm.fallback=""'])  # 评测不降级：降级之后记下来的就不是这个模型的回答了
     with Workspace(cfg.workspace.root) as ws:
         gateway = make_gateway(cfg, ws)
         for model in models:
@@ -453,18 +474,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="预先同意需确认的操作（训练、删除）")
 
     ai = group("aieval", "AI 评测：语言模型会不会操作这个平台")
-    p = leaf(ai, "run", "在单步的工具调用用例上评测一个或多个模型，结果入库", cmd_aieval_run)
+    p = leaf(ai, "run", "在单步或多步用例上评测一个或多个模型，结果入库", cmd_aieval_run)
+    p.add_argument(
+        "--suite", default=TOOLCALL, choices=AI_SUITES, help="toolcall 单步工具调用，task 多步任务"
+    )
     p.add_argument(
         "--model", nargs="+", metavar="名称", help="配置里 [llm.models] 下的名称；省略时用 llm.default"
     )
     p.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2], metavar="种子")
-    p.add_argument("--bucket", nargs="+", choices=BUCKETS, help="只跑这些桶")
+    p.add_argument("--bucket", nargs="+", choices=BUCKETS, help="只跑这些桶（仅 toolcall）")
     p.add_argument(
         "--limit", type=int, default=0, help="只跑这么多条（等间隔抽），试跑用；用例集的指纹会不同"
     )
     p.add_argument("--force", action="store_true", help="已有结果时删掉重跑")
     p = leaf(ai, "report", "由结果库生成对比报告（Markdown）", cmd_aieval_report)
-    p.add_argument("--suite", default=TOOLCALL, choices=[TOOLCALL])
+    p.add_argument("--suite", default=TOOLCALL, choices=AI_SUITES)
 
     p = leaf(group("runs", "运行记录"), "list", "最近的运行", cmd_runs_list)
     p.add_argument("--limit", type=int, default=20)

@@ -51,8 +51,8 @@ POLICIES: tuple[str, ...] = tuple(zoo_names(fixture_config(Path("unused"))))
 
 
 @contextmanager
-def _on_cpu() -> Iterator[None]:
-    """固定工作区一律在 CPU 上建：结果逐位确定，与机器无关。"""
+def on_cpu() -> Iterator[None]:
+    """固定工作区一律在 CPU 上建与跑：结果逐位确定，与机器无关。"""
     previous = os.environ.get("ROBOARENA_DEVICE")
     os.environ["ROBOARENA_DEVICE"] = "cpu"
     try:
@@ -68,7 +68,7 @@ def build_fixture(root: Path) -> Config:
     """在 root 建固定工作区：两个数据集、两个评测集、七个策略和它们的评测结果。"""
     cfg = fixture_config(root)
     probe = with_overrides(cfg, _PROBE)
-    with _on_cpu(), Workspace(root) as ws:
+    with on_cpu(), Workspace(root) as ws:
         build_dataset(ws, cfg)
         build_dataset(ws, with_overrides(cfg, _MINI))
         service.create_suite(ws, cfg)

@@ -211,3 +211,22 @@ def test_chat_reports_a_model_failure_in_one_line(run, scripted):
     scripted(qwen7b=[])
     code, _, err = run("chat", "--once", "在吗")
     assert code == 1 and err.count("\n") == 1 and "错误：" in err and "脚本只有 0 条回答" in err
+
+
+def test_aieval_task_suite_cli_flow(run, scripted, fixture_root, monkeypatch):
+    from roboarena.aieval import run as aieval_run
+
+    monkeypatch.setattr(aieval_run, "ensure_fixture", lambda cache: fixture_root)
+
+    code, out, _ = run("aieval", "report", "--suite", "task")
+    assert code == 0 and "还没有评测结果" in out
+
+    code, _, err = run("aieval", "run", "--suite", "task", "--bucket", "seen")
+    assert code == 1 and "task 套件不分桶" in err
+
+    scripted(qwen7b=["回答。" for _ in range(10)])
+    code, out, _ = run("aieval", "run", "--suite", "task", "--seeds", "0", "--limit", "2")
+    assert code == 0 and "qwen7b（verify/ollama-" in out and "/2，" in out
+
+    code, out, _ = run("aieval", "report", "--suite", "task")
+    assert code == 0 and "# AI 评测报告：task" in out and "任务完成率" in out

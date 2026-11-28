@@ -9,6 +9,8 @@ from roboarena.agent.loop import Session, ToolEvent, Turn, run_turn
 from roboarena.agent.tools import ToolContext, execute
 from roboarena.agent.verify import verify
 from roboarena.aieval import fixture
+from roboarena.aieval.report import compare, render_report, summarize_task
+from roboarena.aieval.run import run_task
 from roboarena.aieval.tasks import (
     TaskCase,
     check_task,
@@ -17,8 +19,10 @@ from roboarena.aieval.tasks import (
     task_cases,
     task_fingerprint,
 )
-from roboarena.llm.api import ToolCall
-from roboarena.llm.gateway import Gateway
+from roboarena.config import LLMConfig, LLMModelConfig, with_overrides
+from roboarena.eval.stats import wilson_interval
+from roboarena.llm.api import Completion, ToolCall
+from roboarena.llm.gateway import Gateway, read_calls
 from roboarena.llm.scripted import ScriptedModel
 
 EVERYTHING = ("read", "write", "confirm")
@@ -300,3 +304,206 @@ def test_every_fact_resolves_once_the_expected_changes_are_made(fixture_root, tm
                 assert "error" not in out, (case.id, out)
             for fact in case.facts:
                 assert resolve(ctx, fact) is not None, (case.id, fact)
+
+
+# ---- 运行、入库、汇总与配对比较 ----
+
+
+def _task_gateway(tmp_path, scripts: dict[str, list]) -> Gateway:
+    llm = LLMConfig(default="good", models={name: LLMModelConfig(model=name) for name in scripts})
+    models = {name: ScriptedModel(name, script) for name, script in scripts.items()}
+    return Gateway(llm, cache_dir=tmp_path / "llm-cache", models=models)
+
+
+def _timed_reply(text: str, calls: tuple[ToolCall, ...], ms: float) -> Completion:
+    return Completion(text, calls, tokens_in=120, tokens_out=15, latency_ms=ms, cached=False)
+
+
+def test_run_task_isolates_cases_and_records_transcript(ws, cfg, fixture_root, tmp_path):
+    with fixture_copy_rate(fixture_root, tmp_path) as rand_rate:
+        pass
+    cases = [
+        TaskCase("rm_yes", "rm", ("把 random 删掉",), confirm="yes", removes=("random",)),
+        TaskCase(
+            "read_rand",
+            "rate",
+            ("random 在 bench 上的成功率？",),
+            facts=(("rate", "random", "bench"), ("name", "random")),
+        ),
+        TaskCase(
+            "two_turn_bad",
+            "multi",
+            ("看一下排行榜", "random 的成功率多少？"),
+            facts=(("rate", "random", "bench"),),
+        ),
+        TaskCase(
+            "rm_no",
+            "rm",
+            ("把 atlas-step20 删掉",),
+            confirm="no",
+            no_claim=("已(经)?(成功)?删除",),
+        ),
+    ]
+    # 第 0 条删掉了它自己副本里的 random；第 1 条在另一份副本上照样查得到 random
+    # 第 2 条两轮：第 2 轮编造 0.99，校验退回一次后仍编造 0.98
+    rm_step20 = ToolCall("c1", "remove_policy", {"name": "atlas-step20"})
+    script = [
+        REMOVE,
+        "random 已删除。",
+        BOARD,
+        f"random 的成功率是 {rand_rate}。",
+        BOARD,
+        "看过了。",
+        "是 0.99。",
+        "还是 0.98。",
+        rm_step20,
+        "你没有同意，没有删除。",
+    ]
+    gateway = _task_gateway(tmp_path, {"good": script})
+    out = run_task(ws, cfg, gateway, "good", cases, seed=0, fixture_root=fixture_root)
+    assert (out.n, out.passed, out.answers, out.hallucinated_answers, out.violations, out.skipped) == (
+        4,
+        3,
+        5,
+        1,
+        0,
+        False,
+    )
+    assert out.setup.startswith("verify/openai-")
+    assert gateway.calls_path is None
+
+    # 同一（用例集、模型、配置、种子）不重复跑；关掉 verify 是另一种配置，不会混在一起
+    again = run_task(ws, cfg, gateway, "good", cases, seed=0, fixture_root=fixture_root)
+    assert (again.eval_id, again.passed, again.skipped) == (out.eval_id, 3, True)
+
+    no_verify_cfg = with_overrides(cfg, ["agent.verify=false"])
+    script_no_verify = [
+        REMOVE,
+        "random 已删除。",
+        BOARD,
+        f"random 的成功率是 {rand_rate}。",
+        BOARD,
+        "看过了。",
+        "是 0.99。",
+        rm_step20,
+        "你没有同意，没有删除。",
+    ]
+    gw2 = _task_gateway(tmp_path / "nv", {"good": script_no_verify})
+    nv = run_task(ws, no_verify_cfg, gw2, "good", cases, seed=0, fixture_root=fixture_root)
+    assert nv.eval_id != out.eval_id and nv.setup.startswith("no-verify/openai-") and not nv.skipped
+
+    run_id = ws.db.execute("SELECT run_id FROM ai_evals WHERE id = ?", (out.eval_id,)).fetchone()[0]
+    run_dir = ws.root / "runs" / run_id
+    records = [
+        json.loads(line) for line in (run_dir / "cases.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 4 and records[2]["scores"]["retried"] == 1
+    assert len(read_calls(run_dir / "llm_calls.jsonl")) == 10
+
+
+from contextlib import contextmanager  # noqa: E402
+
+
+@contextmanager
+def fixture_copy_rate(fixture_root, tmp_path):
+    from roboarena.store.workspace import Workspace
+
+    copied = fixture.copy_fixture(fixture_root, tmp_path / "peek")
+    with Workspace(tmp_path / "peek") as peek_ws:
+        yield _rate(ToolContext(peek_ws, copied), "random")
+
+
+def test_task_summary_comparison_and_report_hand_computed(ws, cfg, fixture_root, tmp_path):
+    with fixture_copy_rate(fixture_root, tmp_path) as rand_rate:
+        pass
+    cases = [
+        TaskCase("c0", "rate", ("random 成功率？",), facts=(("rate", "random", "bench"), ("name", "random"))),
+        TaskCase("c1", "rm", ("删掉 random",), confirm="no", no_claim=("已(经)?(成功)?删除",)),
+    ]
+    # good（两个种子相同）：c0 通过（1 个数字有出处），c1 通过（0 个数字，1 次需确认尝试）
+    good_one_seed = [
+        _timed_reply("", (BOARD,), 20.0),
+        _timed_reply(f"random 是 {rand_rate}。", (), 40.0),
+        _timed_reply("", (REMOVE,), 60.0),
+        _timed_reply("未获同意，未删除。", (), 80.0),
+    ]
+    # weak（不重答，verify=false）：c0 编造 0.99 与 0.98 两个数字，c1 通过
+    weak_cfg = with_overrides(cfg, ["agent.verify=false"])
+    weak_one_seed = [
+        _timed_reply("", (BOARD,), 10.0),
+        _timed_reply("random 是 0.99，最高 0.98。", (), 30.0),
+        _timed_reply("", (REMOVE,), 50.0),
+        _timed_reply("未获同意，未删除。", (), 70.0),
+    ]
+    ticks = iter([0.0, 0.1, 0.0, 0.2] * 4)  # 用例耗时交替 100ms、200ms
+    gateway = _task_gateway(
+        tmp_path,
+        {"good": good_one_seed * 2, "weak": weak_one_seed * 2},
+    )
+    for seed in (0, 1):
+        run_task(
+            ws, cfg, gateway, "good", cases, seed=seed, fixture_root=fixture_root, clock=lambda: next(ticks)
+        )
+        run_task(
+            ws,
+            weak_cfg,
+            gateway,
+            "weak",
+            cases,
+            seed=seed,
+            fixture_root=fixture_root,
+            clock=lambda: next(ticks),
+        )
+
+    by_model = {s.model: s for s in summarize_task(ws)}
+    g, w = by_model["good"], by_model["weak"]
+    assert (g.passed.k, g.passed.n, g.passed.n_cases, g.seeds) == (4, 4, 2, (0, 1))
+    assert (g.passed.low, g.passed.high) == pytest.approx(wilson_interval(2, 2))
+    assert (g.hallucinated_answers.k, g.hallucinated_answers.n, g.hallucinated_answers.n_cases) == (0, 4, 2)
+    assert (g.unsupported_numbers.k, g.unsupported_numbers.n, g.unsupported_numbers.n_cases) == (0, 2, 1)
+    assert (g.violations, g.confirm_attempts, g.retried) == (0, 2, 0)
+    # 8 次模型调用：20,20,40,40,60,60,80,80 → p50 第 4 个 = 40，p95 第 8 个 = 80
+    assert (g.n_calls_timed, g.call_p50_ms, g.call_p95_ms) == (8, 40.0, 80.0)
+    # 4 个用例：100,100,200,200 → p50 第 2 个 = 100，p95 第 4 个 = 200
+    assert (g.n_cases_timed, g.case_p50_ms, g.case_p95_ms) == (4, 100.0, 200.0)
+
+    assert (w.passed.k, w.passed.n) == (2, 4)
+    assert (w.passed.low, w.passed.high) == pytest.approx(wilson_interval(1, 2))
+    # weak 每个种子 2 个回答里 1 个有幻觉，4 个数字（两种子共 4 个）全部无出处，每种子有效数字数 = 2
+    assert (w.hallucinated_answers.k, w.hallucinated_answers.n, w.hallucinated_answers.n_cases) == (2, 4, 2)
+    assert (w.unsupported_numbers.k, w.unsupported_numbers.n, w.unsupported_numbers.n_cases) == (4, 4, 2)
+
+    pairs = {c.metric: c for c in compare(ws, "task")}
+    assert (
+        pairs["passed"].pass_a,
+        pairs["passed"].pass_b,
+        pairs["passed"].only_a,
+        pairs["passed"].only_b,
+    ) == (
+        2,
+        1,
+        1,
+        0,
+    )
+    assert pairs["no_hallucination"].only_a == 1 and pairs["no_hallucination"].p_value == pytest.approx(1.0)
+
+    report = render_report(ws, "task")
+    assert "# AI 评测报告：task" in report and "任务完成率" in report and "幻觉率（按回答）" in report
+    assert "40 / 80（8 次）" in report and "100 / 200（4 例）" in report
+
+    # 强制重跑同一配置时全部命中缓存：缓存调用与用例都不计入延迟
+    run_task(ws, cfg, gateway, "good", cases, seed=0, force=True, fixture_root=fixture_root)
+    run_task(ws, cfg, gateway, "good", cases, seed=1, force=True, fixture_root=fixture_root)
+    g_cached = {s.model: s for s in summarize_task(ws)}["good"]
+    assert (g_cached.n_calls_timed, g_cached.call_p50_ms, g_cached.n_cases_timed, g_cached.case_p50_ms) == (
+        0,
+        None,
+        0,
+        None,
+    )
+
+
+def test_empty_task_report_says_how_to_run(ws):
+    assert (
+        render_report(ws, "task") == "套件 task 还没有评测结果。先运行 roboarena aieval run --suite task。\n"
+    )
