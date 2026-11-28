@@ -6,8 +6,13 @@ import argparse
 import json
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import MISSING, fields
+from typing import Any
 
 from roboarena import __version__
+from roboarena.agent.chat import open_chat
+from roboarena.agent.loop import ToolEvent, Turn
+from roboarena.agent.tools import ACCESS_ZH, TOOLS, Tool
 from roboarena.aieval.cases import BUCKETS, toolcall_cases
 from roboarena.aieval.report import render_report as render_ai_report
 from roboarena.aieval.run import TOOLCALL, run_toolcall
@@ -18,6 +23,7 @@ from roboarena.core.log import setup_logging
 from roboarena.data.dataset import build_dataset, load_dataset, render_report, verify_dataset
 from roboarena.eval import service
 from roboarena.eval.rollouts import collect_rollouts
+from roboarena.llm.api import Message
 from roboarena.llm.gateway import Gateway
 from roboarena.policies import list_policy_backends
 from roboarena.policies.train import train_policy
@@ -226,6 +232,117 @@ def cmd_runs_list(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def make_gateway(cfg: Config, ws: Workspace) -> Gateway:
+    """命令行用的模型网关。缓存放在工作区的 cache/llm/ 下。"""
+    return Gateway(cfg.llm, cache_dir=ws.root / "cache" / "llm")
+
+
+def cmd_llm_list(cfg: Config, args: argparse.Namespace) -> int:
+    rows = [
+        (name, m.backend, m.model, m.base_url, "是" if name == cfg.llm.default else "")
+        for name, m in cfg.llm.models.items()
+    ]
+    print(_table(("名称", "后端", "模型", "服务地址", "默认"), rows))
+    return 0
+
+
+def cmd_llm_ping(cfg: Config, args: argparse.Namespace) -> int:
+    # 不用缓存、不重试、不降级：要看的就是这个模型现在通不通
+    cfg = with_overrides(cfg, ["llm.cache=false", "llm.retries=0", 'llm.fallback=""'])
+    failed = 0
+    with Workspace(cfg.workspace.root) as ws:
+        gateway = make_gateway(cfg, ws)
+        for name in args.model or list(cfg.llm.models):
+            try:
+                done = gateway.complete([Message("user", "只回复一个字：好")], model=name, max_tokens=16)
+            except RoboArenaError as exc:
+                failed += 1
+                print(f"{name}：失败：{exc}", flush=True)
+            else:
+                print(
+                    f"{name}：正常，{done.latency_ms:.0f} 毫秒（输入 {done.tokens_in} / 输出 {done.tokens_out} token）",
+                    flush=True,
+                )
+    return 1 if failed else 0
+
+
+def cmd_agent_tools(cfg: Config, args: argparse.Namespace) -> int:
+    def params(tool: Tool) -> str:
+        names = [
+            f.name + ("*" if f.default is MISSING and f.default_factory is MISSING else "")
+            for f in fields(tool.args)
+        ]
+        return "、".join(names) or "（无）"
+
+    rows = [(t.name, ACCESS_ZH[t.access], params(t), t.description) for t in TOOLS.values()]
+    print(_table(("工具", "权限", "参数", "说明"), rows))
+    return 0
+
+
+def _event_line(event: ToolEvent, *, asked: bool) -> str:
+    """一次工具调用的一行说明。asked 表示这次对话里能当面问用户（交互方式）。"""
+    if event.status == "ok":
+        note = "成功" + (("（用户已确认）" if asked else "（已预先同意）") if event.approved else "")
+    elif event.status == "declined":
+        note = "用户没有同意，未执行" if asked else "没有得到确认，未执行"
+    else:
+        label = {
+            "error": "报错",
+            "invalid": "调用不成立",
+            "denied": "没有权限，未执行",
+            "skipped": "超出上限，未执行",
+        }
+        note = label[event.status] + (
+            f"：{event.observation.get('error')}" if event.status in ("error", "invalid") else ""
+        )
+    return f"· {event.name or '（无名）'} {json.dumps(event.args, ensure_ascii=False)} → {note}"
+
+
+def _print_turn(turn: Turn, *, asked: bool) -> None:
+    for event in turn.events:
+        print(_event_line(event, asked=asked))
+    print(turn.answer, flush=True)
+
+
+def _ask(tool: Tool, tool_args: dict[str, Any]) -> bool:
+    reply = input(f"确认执行 {tool.name} {json.dumps(tool_args, ensure_ascii=False)}？[y/N] ")
+    return reply.strip().lower() in ("y", "yes", "是")
+
+
+def cmd_chat(cfg: Config, args: argparse.Namespace) -> int:
+    with Workspace(cfg.workspace.root) as ws:
+        gateway = make_gateway(cfg, ws)
+        with open_chat(ws, cfg, gateway, resume=args.resume, model=args.model) as chat:
+            if args.once is not None:
+                # 单次提问没有办法当面问用户：需确认的操作只有 --yes 预先同意了才执行
+                turn = chat.say(args.once, confirm=(lambda tool, a: True) if args.yes else None)
+                _print_turn(turn, asked=False)
+                print(
+                    f"（对话 {chat.run.id} ｜ 模型调用 {turn.steps} 次 ｜ 输入 {turn.tokens_in} / 输出 {turn.tokens_out} token）"
+                )
+                return 0
+            print(f"（对话 {chat.run.id}，模型 {chat.model}；输入 exit 结束）")
+            while True:
+                try:
+                    text = input("你> ").strip()
+                except EOFError:
+                    break
+                if text in ("exit", "quit", "退出"):
+                    break
+                if not text:
+                    continue
+                try:
+                    turn = chat.say(text, confirm=(lambda tool, a: True) if args.yes else _ask)
+                except RoboArenaError as exc:  # 这一轮没成，对话还在，可以接着说
+                    print(f"错误：{exc}", file=sys.stderr)
+                    continue
+                _print_turn(turn, asked=not args.yes)
+            print(
+                f"（对话 {chat.run.id} ｜ 共 {chat.turns} 轮；接着聊：roboarena chat --resume {chat.run.id}）"
+            )
+    return 0
+
+
 def cmd_aieval_run(cfg: Config, args: argparse.Namespace) -> int:
     cases = toolcall_cases()
     if args.bucket:
@@ -235,7 +352,7 @@ def cmd_aieval_run(cfg: Config, args: argparse.Namespace) -> int:
     models = args.model or [cfg.llm.default]
     cfg = with_overrides(cfg, ['llm.fallback=""'])  # 评测不降级：降级之后记下来的就不是这个模型的回答了
     with Workspace(cfg.workspace.root) as ws:
-        gateway = Gateway(cfg.llm, cache_dir=ws.root / "cache" / "llm")
+        gateway = make_gateway(cfg, ws)
         for model in models:
             for seed in args.seeds:
                 out = run_toolcall(ws, cfg, gateway, model, cases, seed=seed, force=args.force)
@@ -321,6 +438,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="已有结果时删掉重跑")
     p = leaf(ev, "leaderboard", "排行榜：成功率与 Wilson 区间", cmd_eval_leaderboard)
     p.add_argument("--sim", default=service.REAL)
+
+    llm = group("llm", "模型网关")
+    leaf(llm, "list", "配置里的语言模型", cmd_llm_list)
+    p = leaf(llm, "ping", "给每个模型发一条最短的请求，看通不通", cmd_llm_ping)
+    p.add_argument("--model", nargs="+", metavar="名称", help="只试这几个；省略表示全部")
+
+    leaf(group("agent", "Agent"), "tools", "Agent 可用的工具、权限与参数（带 * 的必填）", cmd_agent_tools)
+
+    p = leaf(sub, "chat", "用自然语言操作平台；不带 --once 时进入交互", cmd_chat)
+    p.add_argument("--once", metavar="文本", help="只问这一句，答完就结束")
+    p.add_argument("--resume", metavar="运行编号", help="接着这次对话继续")
+    p.add_argument("--model", metavar="名称", help="配置里 [llm.models] 下的名称；省略时用 llm.default")
+    p.add_argument("--yes", action="store_true", help="预先同意需确认的操作（训练、删除）")
 
     ai = group("aieval", "AI 评测：语言模型会不会操作这个平台")
     p = leaf(ai, "run", "在单步的工具调用用例上评测一个或多个模型，结果入库", cmd_aieval_run)

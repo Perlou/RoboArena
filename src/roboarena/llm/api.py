@@ -39,6 +39,8 @@ class Completion:
     tokens_out: int
     latency_ms: float
     cached: bool
+    # 生成为什么停下：stop 正常结束，length 达到输出上限，aborted 被服务端中止；其余的值照服务端给的原样记
+    finish_reason: str = "stop"
 
 
 class ChatModel(Protocol):

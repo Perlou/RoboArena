@@ -138,3 +138,48 @@ def test_default_llm_models_point_at_the_local_server():
 def test_bad_llm_settings_are_rejected(overrides, message):
     with pytest.raises(ConfigError, match=message):
         load_config(overrides=overrides)
+
+
+def test_default_models_use_the_raw_backend_with_the_projects_own_rendering():
+    llm = Config().llm
+    assert {name: (m.backend, m.base_url, m.model, m.assistant_prefix) for name, m in llm.models.items()} == {
+        "qwen7b": ("ollama", "http://127.0.0.1:11434", "qwen2.5:7b", ""),
+        "qwen08b": ("ollama", "http://127.0.0.1:11434", "qwen3.5:0.8b", "<think>\n"),  # 带思考的模型
+    }
+    assert {m.num_ctx for m in llm.models.values()} == {8192}  # 显式给，不依赖服务的默认值（4096）
+    with pytest.raises(ConfigError, match="llm.models.qwen7b.num_ctx 不能是负数"):
+        load_config(overrides=["llm.models.qwen7b.num_ctx=-1"])
+
+
+def test_backends_are_checked_and_the_prefix_round_trips(tmp_path):
+    cfg = load_config(
+        overrides=['llm.models.x.backend="ollama"', 'llm.models.x.assistant_prefix="<think>\\n"']
+    )
+    assert cfg.llm.models["x"].assistant_prefix == "<think>\n"
+    again = Config()
+    from roboarena.config import _apply
+
+    _apply(again, tomllib.loads(cfg.to_toml()))
+    assert again == cfg  # 带换行的字符串写成 TOML 再读回来不变
+    with pytest.raises(ConfigError, match="backend 应为 openai、ollama 之一，实际是 'grpc'"):
+        load_config(overrides=['llm.models.x.backend="grpc"'])
+
+
+def test_agent_limits_have_defaults_and_are_validated():
+    agent = Config().agent
+    assert (agent.max_steps, agent.max_tool_calls, agent.verify) == (8, 12, True)
+    assert agent.context_tokens < min(
+        m.num_ctx for m in Config().llm.models.values()
+    )  # 预算要小于模型的上下文
+    for key in (
+        "max_steps",
+        "max_tool_calls",
+        "max_tokens",
+        "answer_tokens",
+        "context_tokens",
+        "observation_chars",
+    ):
+        with pytest.raises(ConfigError, match=f"agent.{key} 应大于 0"):
+            load_config(overrides=[f"agent.{key}=0"])
+    with pytest.raises(ConfigError, match="agent.max_seconds 应大于 0"):
+        load_config(overrides=["agent.max_seconds=0"])

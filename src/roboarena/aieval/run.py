@@ -46,10 +46,23 @@ class AiEvalOutcome:
     skipped: bool  # 库里已有同一次评测的结果，没有重跑
 
 
-def setup_id(name: str, system: str, tools: Sequence[ToolSpec], max_tokens: int = MAX_TOKENS) -> str:
-    """配置的标识：名称加上提示、工具描述、输出上限的摘要。这些一变就是另一种配置，不会和旧结果混在一起。"""
+def setup_id(
+    name: str, system: str, tools: Sequence[ToolSpec], model_id: str, max_tokens: int = MAX_TOKENS
+) -> str:
+    """配置的标识：名称加上系统提示、工具描述、输出上限、模型身份的摘要。
+
+    这些一变就是另一种配置，不会和旧结果混在一起。模型身份（后端、服务地址、模型标识、助手开头）算进来，
+    是因为配置里同一个名称可以改指别的后端或别的服务：提示由谁渲染变了，结果就不能当成同一次评测。
+    """
     digest = sha256_text(
-        canonical_json({"system": system, "tools": [asdict(t) for t in tools], "max_tokens": max_tokens})
+        canonical_json(
+            {
+                "system": system,
+                "tools": [asdict(t) for t in tools],
+                "max_tokens": max_tokens,
+                "model": model_id,
+            }
+        )
     )
     return f"{name}-{digest[:8]}"
 
@@ -72,7 +85,9 @@ def run_toolcall(
     if gateway.cfg.fallback:
         raise ValueError("评测用的网关不能配置备用模型")
     specs = tool_specs()
-    key = (suite_fingerprint(cases), model, setup_id(setup, SYSTEM_PROMPT, specs), seed)
+    backend = gateway.cfg.models[model].backend if model in gateway.cfg.models else "?"
+    setup_name = setup_id(f"{setup}/{backend}", SYSTEM_PROMPT, specs, gateway.model_id(model))
+    key = (suite_fingerprint(cases), model, setup_name, seed)
     if (existing := store.find_ai_eval(ws, key)) is not None:
         if existing["status"] == "done" and not force:
             old = [r for r in store.ai_case_rows(ws, TOOLCALL) if r["eval_id"] == existing["id"]]
@@ -98,7 +113,7 @@ def run_toolcall(
                     score = check_toolcall(case, done.tool_calls)
                     valid += score.valid
                     matched += score.match
-                    scores = {**asdict(score), "cached": done.cached}
+                    scores = {**asdict(score), "cached": done.cached, "finish": done.finish_reason}
                     rows.append((
                         case.id, case.family, case.bucket, score.match, canonical_json(scores),
                         done.latency_ms, done.tokens_in, done.tokens_out, 1,

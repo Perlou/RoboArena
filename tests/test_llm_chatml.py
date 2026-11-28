@@ -41,7 +41,10 @@ def test_without_tools_there_is_no_tool_block():
     assert chatml.render([Message("system", "你是助手"), Message("user", "在吗")]) == (
         "<|im_start|>system\n你是助手<|im_end|>\n<|im_start|>user\n在吗<|im_end|>\n<|im_start|>assistant\n"
     )
-    assert chatml.render([Message("user", "在吗")]) == "<|im_start|>user\n在吗<|im_end|>\n<|im_start|>assistant\n"
+    assert (
+        chatml.render([Message("user", "在吗")])
+        == "<|im_start|>user\n在吗<|im_end|>\n<|im_start|>assistant\n"
+    )
 
 
 def test_tools_without_a_system_message_get_their_own_block():
@@ -52,7 +55,9 @@ def test_tools_without_a_system_message_get_their_own_block():
 
 
 def test_prefix_is_written_after_the_assistant_header():
-    assert chatml.render([Message("user", "在吗")], prefix="<think>\n").endswith("<|im_start|>assistant\n<think>\n")
+    assert chatml.render([Message("user", "在吗")], prefix="<think>\n").endswith(
+        "<|im_start|>assistant\n<think>\n"
+    )
 
 
 HISTORY = [
@@ -139,7 +144,10 @@ def test_text_around_calls_is_kept_and_calls_are_numbered():
 
 def test_missing_or_null_arguments_mean_no_arguments():
     for body in ('{"name": "list_policies"}', '{"name": "list_policies", "arguments": null}'):
-        assert chatml.parse(f"<tool_call>\n{body}\n</tool_call>") == ("", (ToolCall("call_0", "list_policies", {}),))
+        assert chatml.parse(f"<tool_call>\n{body}\n</tool_call>") == (
+            "",
+            (ToolCall("call_0", "list_policies", {}),),
+        )
 
 
 def test_reasoning_is_dropped():
@@ -148,7 +156,10 @@ def test_reasoning_is_dropped():
 
 
 def test_a_call_mentioned_while_reasoning_is_not_a_call():
-    assert chatml.parse(f"<think>\n我该输出 {CALL} 吗？再想想。\n</think>\n\n不需要工具。") == ("不需要工具。", ())
+    assert chatml.parse(f"<think>\n我该输出 {CALL} 吗？再想想。\n</think>\n\n不需要工具。") == (
+        "不需要工具。",
+        (),
+    )
 
 
 def test_unfinished_reasoning_yields_nothing():
@@ -165,7 +176,7 @@ def test_a_closing_tag_alone_still_ends_the_reasoning():
 @pytest.mark.parametrize(
     "body",
     [
-        '{"name": "leaderboard", "arguments": {"suite": ',  # JSON 不完整
+        '{"name": "leaderboard", "arguments": {"suite":',  # JSON 不完整
         "leaderboard(suite=main)",  # 不是 JSON
         '["leaderboard"]',  # 不是对象
         '{"arguments": {}}',  # 没有工具名
@@ -173,7 +184,10 @@ def test_a_closing_tag_alone_still_ends_the_reasoning():
     ],
 )
 def test_an_unparseable_block_is_kept_verbatim_with_no_name(body):
-    assert chatml.parse(f"<tool_call>\n{body}\n</tool_call>") == ("", (ToolCall("call_0", "", {}, raw_arguments=body),))
+    assert chatml.parse(f"<tool_call>\n{body}\n</tool_call>") == (
+        "",
+        (ToolCall("call_0", "", {}, raw_arguments=body),),
+    )
 
 
 @pytest.mark.parametrize(
@@ -182,8 +196,15 @@ def test_an_unparseable_block_is_kept_verbatim_with_no_name(body):
 )
 def test_arguments_that_are_not_an_object_are_kept_as_text(arguments):
     """参数必须是 JSON 对象。数组、字符串（哪怕里面是一段 JSON）、数值都不算，原文交给上层。"""
-    (call,) = chatml.parse(f'<tool_call>\n{{"name": "leaderboard", "arguments": {arguments}}}\n</tool_call>')[1]
-    assert (call.id, call.name, call.arguments, call.raw_arguments) == ("call_0", "leaderboard", {}, arguments)
+    (call,) = chatml.parse(f'<tool_call>\n{{"name": "leaderboard", "arguments": {arguments}}}\n</tool_call>')[
+        1
+    ]
+    assert (call.id, call.name, call.arguments, call.raw_arguments) == (
+        "call_0",
+        "leaderboard",
+        {},
+        arguments,
+    )
 
 
 def test_the_last_block_may_lack_its_closing_tag():

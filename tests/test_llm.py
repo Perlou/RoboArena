@@ -402,10 +402,198 @@ def test_the_key_never_reaches_records_cache_or_errors(tmp_path, monkeypatch):
 )
 def test_local_servers_are_not_reached_through_the_proxy(monkeypatch, base_url, uses_proxy):
     """环境里设了代理时，发往本机服务的请求不能交给代理（否则连不上）。"""
-    from roboarena.llm.openai_compat import is_loopback
+    from roboarena.llm.http import is_loopback
 
     monkeypatch.setenv("http_proxy", "http://proxy.test:7890")
     monkeypatch.setenv("all_proxy", "http://proxy.test:7890")
     assert is_loopback(base_url) is not uses_proxy
     model = OpenAIChatModel("m", LLMModelConfig(base_url=base_url, model="m"))
     assert model._client.trust_env is uses_proxy
+
+
+# ---- 原样补全的适配器（Ollama 的 /api/generate，raw）：提示由项目自己渲染，输出由项目自己解析 ----
+
+from roboarena.llm import chatml  # noqa: E402
+from roboarena.llm.ollama_raw import OllamaRawModel  # noqa: E402
+
+LOCAL = LLMModelConfig(backend="ollama", base_url="http://127.0.0.1:11434/", model="m-raw")
+
+
+def _raw(handler, cfg: LLMModelConfig = LOCAL, **kwargs) -> OllamaRawModel:
+    return OllamaRawModel("local", cfg, transport=httpx.MockTransport(handler), **kwargs)
+
+
+def _generated(response: str, **fields) -> dict:
+    return {
+        "response": response,
+        "done": True,
+        "done_reason": "stop",
+        "prompt_eval_count": 40,
+        "eval_count": 9,
+        **fields,
+    }
+
+
+def test_raw_adapter_sends_its_own_prompt_and_parses_the_output():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        text = '<tool_call>\n{"name": "leaderboard", "arguments": {"suite": "main"}}\n</tool_call>'
+        return httpx.Response(200, json=_generated(text))
+
+    asked = [Message("system", "你是助手"), Message("user", "谁最高？")]
+    done = _raw(handler).complete(asked, [LEADERBOARD], temperature=0.0, max_tokens=64, seed=7)
+
+    assert done.tool_calls == (ToolCall("call_0", "leaderboard", {"suite": "main"}),)
+    assert (done.text, done.tokens_in, done.tokens_out, done.cached, done.finish_reason) == (
+        "",
+        40,
+        9,
+        False,
+        "stop",
+    )
+    (request,) = seen
+    assert str(request.url) == "http://127.0.0.1:11434/api/generate"
+    body = json.loads(request.content)
+    assert body == {
+        "model": "m-raw",
+        "prompt": chatml.render(asked, [LEADERBOARD]),
+        "raw": True,  # 不让服务端套它自己的模板
+        "stream": False,
+        "options": {"temperature": 0.0, "num_predict": 64, "seed": 7},
+    }
+
+
+def test_raw_adapter_writes_the_prefix_and_reads_the_output_as_its_continuation():
+    """带思考的模型：助手开头的 <think> 写在提示里，解析时要拼回来，思考的内容才会被丢掉。"""
+    thinking = LLMModelConfig(backend="ollama", model="m-think", assistant_prefix="<think>\n")
+    prompts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        prompts.append(json.loads(request.content)["prompt"])
+        return httpx.Response(
+            200, json=_generated("要不要调用 <tool_call>…</tool_call>？不用。\n</think>\n\n最高的是 a")
+        )
+
+    done = _raw(handler, thinking).complete([Message("user", "谁最高？")])
+    assert prompts[0].endswith("<|im_start|>assistant\n<think>\n")
+    assert (done.text, done.tool_calls) == ("最高的是 a", ())
+
+
+@pytest.mark.parametrize(
+    "reply, finish, tokens",
+    [
+        (_generated("好"), "stop", (40, 9)),
+        (_generated("好", done_reason="length"), "length", (40, 9)),
+        # 服务端中止（如同一个 token 重复太多次）：done 为 false，没有结束原因，也没有 token 数
+        ({"response": "NNNNNN", "done": False}, "aborted", (0, 0)),
+        ({"response": "好", "done": True, "done_reason": "unload"}, "unload", (0, 0)),
+    ],
+)
+def test_raw_adapter_reports_why_generation_ended(reply, finish, tokens):
+    done = _raw(lambda r: httpx.Response(200, json=reply)).complete([Message("user", "?")])
+    assert (done.finish_reason, (done.tokens_in, done.tokens_out)) == (finish, tokens)
+
+
+@pytest.mark.parametrize(
+    "handler, retryable, message",
+    [
+        (_raises_timeout, True, "模型 local 超时（5 秒内没有回应）"),
+        (_raises_refused, True, "连不上模型 local 的服务 http://127.0.0.1:11434/"),
+        (lambda r: httpx.Response(500, text="坏了"), True, "返回 500：坏了"),
+        (
+            lambda r: httpx.Response(404, json={"error": "model 'm-raw' not found"}),
+            False,
+            "返回 404：.*not found",
+        ),
+        (lambda r: httpx.Response(200, text="<html>"), False, "不是预期的格式"),
+        (lambda r: httpx.Response(200, json={"done": True}), False, "不是预期的格式：缺少字段 'response'"),
+    ],
+)
+def test_raw_adapter_turns_failures_into_model_errors(handler, retryable, message):
+    with pytest.raises(ModelError, match=message) as info:
+        _raw(handler, timeout_s=5).complete([Message("user", "?")])
+    assert info.value.retryable is retryable and "\n" not in str(info.value)
+
+
+def test_raw_adapter_does_not_use_the_proxy_for_a_local_server(monkeypatch):
+    monkeypatch.setenv("http_proxy", "http://proxy.test:7890")
+    assert OllamaRawModel("local", LOCAL)._client.trust_env is False
+
+
+# ---- 结束原因 ----
+
+
+def test_openai_adapter_reports_why_generation_ended():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "半句"}, "finish_reason": "length"}]}
+        )
+
+    assert (
+        _adapter(handler, LLMModelConfig(model="m")).complete([Message("user", "?")]).finish_reason
+        == "length"
+    )
+
+
+def test_finish_reason_defaults_to_stop_and_survives_the_cache(tmp_path):
+    assert ScriptedModel("fake", ["好"]).complete([Message("user", "?")]).finish_reason == "stop"
+    cut = Completion(
+        "半", (), tokens_in=3, tokens_out=512, latency_ms=1.0, cached=False, finish_reason="length"
+    )
+    gateway = Gateway(_llm(), cache_dir=tmp_path / "cache", models={"big": ScriptedModel("big", [cut])})
+    assert [gateway.complete(ASK).finish_reason for _ in range(2)] == ["length", "length"]
+
+
+# ---- 网关按后端建适配器；模型的身份 ----
+
+
+def test_gateway_builds_the_adapter_named_by_the_backend():
+    cfg = LLMConfig(default="a", models={"a": LLMModelConfig(backend="openai", model="m"), "b": LOCAL})
+    gateway = Gateway(cfg)
+    assert type(gateway._model("a")) is OpenAIChatModel and type(gateway._model("b")) is OllamaRawModel
+
+
+def test_model_identity_covers_everything_that_changes_the_answer():
+    base = LLMModelConfig(backend="ollama", base_url="http://127.0.0.1:11434", model="m")
+    variants = {
+        "base": base,
+        "same": LLMModelConfig(backend="ollama", base_url="http://127.0.0.1:11434", model="m", price_in=9.0),
+        "backend": LLMModelConfig(backend="openai", base_url="http://127.0.0.1:11434", model="m"),
+        "url": LLMModelConfig(backend="ollama", base_url="http://127.0.0.1:11435", model="m"),
+        "model": LLMModelConfig(backend="ollama", base_url="http://127.0.0.1:11434", model="m2"),
+        "prefix": LLMModelConfig(
+            backend="ollama", base_url="http://127.0.0.1:11434", model="m", assistant_prefix="<think>\n"
+        ),
+    }
+    gateway = Gateway(LLMConfig(default="base", models=variants))
+    ids = {name: gateway.model_id(name) for name in variants}
+    assert ids["base"] == ids["same"]  # 价格不改变回答
+    assert len({ids[n] for n in ("base", "backend", "url", "model", "prefix")}) == 5
+
+
+# ---- 上下文长度：显式写进请求，不依赖服务的默认值 ----
+
+
+def test_raw_adapter_sends_the_context_length_when_configured():
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json=_generated("好"))
+
+    sized = LLMModelConfig(backend="ollama", model="m", num_ctx=8192)
+    _raw(handler, sized).complete([Message("user", "?")], max_tokens=64, seed=1)
+    _raw(handler, LOCAL).complete([Message("user", "?")], max_tokens=64, seed=1)
+    assert bodies[0]["options"] == {"temperature": 0.0, "num_predict": 64, "seed": 1, "num_ctx": 8192}
+    assert "num_ctx" not in bodies[1]["options"]  # 0 表示用服务的默认值
+
+
+def test_context_length_is_part_of_the_model_identity():
+    """上下文不够时服务端会悄悄截掉提示的开头，回答就变了，所以它算进模型的身份。"""
+    small = LLMModelConfig(backend="ollama", model="m")
+    large = LLMModelConfig(backend="ollama", model="m", num_ctx=8192)
+    gateway = Gateway(LLMConfig(default="small", models={"small": small, "large": large}))
+    assert gateway.model_id("small") != gateway.model_id("large")
+    assert gateway.model_id("large").endswith("|ctx=8192")

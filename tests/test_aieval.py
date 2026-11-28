@@ -289,6 +289,7 @@ def test_scripted_model_scores_exactly_what_was_scripted(ws, cfg, tmp_path):
     assert [r["passed"] for r in rows] == [1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1]
     assert json.loads(rows[3]["scores_json"]) == {
         "cached": False,
+        "finish": "stop",
         "match": False,
         "reason": "没有工具调用",
         "valid": False,
@@ -304,7 +305,10 @@ def test_scripted_model_scores_exactly_what_was_scripted(ws, cfg, tmp_path):
         "done",
     )
     assert record["suite_fp"] == suite_fingerprint(CASES)
-    assert record["setup"] == setup_id("zeroshot", SYSTEM_PROMPT, tool_specs())
+    assert record["setup"] == setup_id(
+        "zeroshot/openai", SYSTEM_PROMPT, tool_specs(), gateway.model_id("good")
+    )
+    assert record["setup"].startswith("zeroshot/openai-")
 
     run_dir = ws.root / "runs" / record["run_id"]
     lines = [json.loads(x) for x in (run_dir / "cases.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -349,6 +353,29 @@ def test_the_same_eval_is_not_recorded_twice(ws, cfg, tmp_path):
         for r in ws.db.execute("SELECT scores_json FROM ai_cases WHERE eval_id = ?", (forced.eval_id,))
     ]
     assert cached == [True] * 12
+
+
+def test_the_same_model_name_reached_another_way_is_another_eval(ws, cfg, tmp_path):
+    """换了后端（提示由谁渲染）或服务地址，就不是同一种配置：不能被当成已有结果跳过，也不能和旧结果混在一起。"""
+    outcomes = []
+    for i, entry in enumerate(
+        (
+            LLMModelConfig(backend="openai", model="m"),
+            LLMModelConfig(backend="ollama", model="m"),
+            LLMModelConfig(backend="ollama", model="m", assistant_prefix="<think>\n"),
+            LLMModelConfig(backend="ollama", model="m", price_in=3.0),  # 价格不改变回答：和第二个是同一次评测
+        )
+    ):
+        llm = LLMConfig(default="good", models={"good": entry})
+        gateway = Gateway(
+            llm, cache_dir=tmp_path / f"cache{i}", models={"good": ScriptedModel("good", _gold(CASES))}
+        )
+        outcomes.append(run_toolcall(ws, cfg, gateway, "good", CASES))
+    assert [o.skipped for o in outcomes] == [False, False, False, True]
+    setups = [r["setup"] for r in ws.db.execute("SELECT setup FROM ai_evals ORDER BY id")]
+    assert len(set(setups)) == 3
+    assert [s.rsplit("-", 1)[0] for s in setups] == ["zeroshot/openai", "zeroshot/ollama", "zeroshot/ollama"]
+    assert len({(s.model, s.setup) for s in summarize(ws, "toolcall")}) == 3  # 报告里是三行，不合并
 
 
 def test_a_failing_model_aborts_the_eval_instead_of_counting_as_wrong(ws, cfg, tmp_path):
@@ -441,6 +468,31 @@ def test_summary_and_comparison_hand_computed(ws, cfg, tmp_path):
     )
     assert "| 11 | 8 | 3 | 0 | 0.25 |" in report
     assert f"用例集 {suite_fingerprint(CASES)[:12]}（12 条用例）" in report
+
+
+def test_finish_reasons_are_recorded_and_counted(ws, cfg, tmp_path):
+    replies: list = _gold(CASES)
+    replies[2] = Completion(
+        "", (), tokens_in=9, tokens_out=512, latency_ms=1.0, cached=False, finish_reason="length"
+    )
+    replies[5] = Completion(
+        "", (), tokens_in=0, tokens_out=0, latency_ms=1.0, cached=False, finish_reason="aborted"
+    )
+    replies[9] = Completion(
+        "", (), tokens_in=0, tokens_out=0, latency_ms=1.0, cached=False, finish_reason="aborted"
+    )
+    out = run_toolcall(ws, cfg, _gateway(tmp_path, {"good": replies}), "good", CASES)
+    scores = [
+        json.loads(r[0])
+        for r in ws.db.execute("SELECT scores_json FROM ai_cases WHERE eval_id = ?", (out.eval_id,))
+    ]
+    assert Counter(s["finish"] for s in scores) == {"stop": 9, "length": 1, "aborted": 2}
+    table = {s.bucket: s for s in summarize(ws, "toolcall")}
+    assert (table[ALL].n_length, table[ALL].n_aborted) == (1, 2)
+    assert (table["seen"].n_length, table["seen"].n_aborted) == (1, 1)
+    assert (table["heldout"].n_length, table["heldout"].n_aborted) == (0, 1)
+    report = render_report(ws, "toolcall")
+    assert "截断 / 中止" in report and "| 1 / 2 |" in report
 
 
 def test_cached_calls_are_left_out_of_latency(ws, cfg, tmp_path):

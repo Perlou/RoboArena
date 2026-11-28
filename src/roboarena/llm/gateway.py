@@ -19,6 +19,7 @@ from roboarena.core.errors import ModelError, NotFoundError
 from roboarena.core.hashing import canonical_json, sha256_text
 from roboarena.core.log import get_logger
 from roboarena.llm.api import ChatModel, Completion, Message, ToolCall, ToolSpec
+from roboarena.llm.ollama_raw import OllamaRawModel
 from roboarena.llm.openai_compat import OpenAIChatModel
 
 log = get_logger(__name__)
@@ -77,13 +78,23 @@ class Gateway:
             known = "、".join(self.cfg.models) or "（空）"
             raise NotFoundError(f"没有名为 {name} 的模型；配置里定义的有：{known}")
         if name not in self._models:
-            self._models[name] = OpenAIChatModel(name, self.cfg.models[name], timeout_s=self.cfg.timeout_s)
+            mc = self.cfg.models[name]
+            adapter = OllamaRawModel if mc.backend == "ollama" else OpenAIChatModel
+            self._models[name] = adapter(name, mc, timeout_s=self.cfg.timeout_s)
         return self._models[name]
 
-    def _model_id(self, name: str) -> str:
-        # 同一个模型标识在不同的服务上可能是不同的权重，所以地址也算进去
+    def model_id(self, name: str) -> str:
+        """模型的身份：会改变回答的那几项配置。缓存的键与 AI 评测的配置标识都用它。
+
+        同一个模型标识在不同的服务上可能是不同的权重，所以地址也算进去；后端决定提示怎么渲染。
+        """
         mc = self.cfg.models[name]
-        return f"{mc.backend}|{mc.base_url}|{mc.model}"
+        parts = [mc.backend, mc.base_url, mc.model]
+        if mc.assistant_prefix:
+            parts.append(mc.assistant_prefix)
+        if mc.num_ctx:  # 上下文不够时服务端会截掉提示的开头，回答就变了
+            parts.append(f"ctx={mc.num_ctx}")
+        return "|".join(parts)
 
     def complete(
         self,
@@ -121,7 +132,7 @@ class Gateway:
         fallback_from: str | None,
     ) -> Completion:
         chat = self._model(name)
-        key = request_key(self._model_id(name), messages, tools, **params)
+        key = request_key(self.model_id(name), messages, tools, **params)
         base = {"model": name, "request": key, "fallback_from": fallback_from}
 
         hit = self._cache_get(key)
@@ -177,6 +188,7 @@ class Gateway:
                 tokens_out=data["tokens_out"],
                 latency_ms=0.0,  # 这次没有调用模型；原来的耗时在第一次调用的记录里
                 cached=True,
+                finish_reason=data.get("finish_reason", "stop"),  # 早先写下的缓存没有这一项
             )
         except (ValueError, KeyError, TypeError):
             log.warning("缓存文件读不出来，当作没有命中", extra={"request": key})
@@ -192,6 +204,7 @@ class Gateway:
             "tool_calls": [asdict(c) for c in done.tool_calls],
             "tokens_in": done.tokens_in,
             "tokens_out": done.tokens_out,
+            "finish_reason": done.finish_reason,
         }
         tmp = path.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -215,6 +228,7 @@ class Gateway:
             "latency_ms": round(done.latency_ms if done else latency_ms or 0.0, 3),
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
+            "finish_reason": done.finish_reason if done else None,
             # 按配置的单价估算；命中缓存的这一次没有花钱，记 0
             "cost": (tokens_in * mc.price_in + tokens_out * mc.price_out) / 1e6 if spent else 0.0,
         }

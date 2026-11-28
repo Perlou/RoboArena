@@ -262,7 +262,8 @@ def _board_row(rank: int, r: service.LeaderboardRow) -> dict[str, Any]:
 
 def _list_policies(ctx: ToolContext, args: NoArgs) -> dict[str, Any]:
     items = list_artifacts(ctx.ws, task=_task_name(ctx), kind="policy")
-    return {"policies": [{"name": a.name, "backend": a.backend, "created_at": a.created_at} for a in items]}
+    listed = [{"name": a.name, "backend": a.backend, "created_at": a.created_at} for a in items]
+    return {"n_policies": len(listed), "policies": listed}  # 个数直接给出来：模型自己数出来的数没有出处
 
 
 def _leaderboard(ctx: ToolContext, args: LeaderboardArgs) -> dict[str, Any]:
@@ -317,7 +318,7 @@ def _list_runs(ctx: ToolContext, args: ListRunsArgs) -> dict[str, Any]:
         " ORDER BY started_at DESC, id DESC LIMIT ?2",
         (args.kind, limit),
     ).fetchall()
-    return {"runs": [dict(r) for r in rows]}
+    return {"n_listed": len(rows), "runs": [dict(r) for r in rows]}
 
 
 _META_KEYS = ("policy", "backend", "sim", "suite", "seed", "device", "git_rev", "git_dirty", "dataset_fp")

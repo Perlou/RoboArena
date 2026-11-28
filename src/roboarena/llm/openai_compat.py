@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -13,12 +12,7 @@ import httpx
 from roboarena.config import LLMModelConfig
 from roboarena.core.errors import ModelError
 from roboarena.llm.api import Completion, Message, ToolCall, ToolSpec
-
-_BODY_CHARS = 200  # 报错里最多带多少个字符的服务端回应
-
-
-def is_loopback(base_url: str) -> bool:
-    return httpx.URL(base_url).host in ("127.0.0.1", "localhost", "::1")
+from roboarena.llm.http import make_client, post_json
 
 
 def _message_payload(message: Message) -> dict[str, Any]:
@@ -92,7 +86,9 @@ def _parse_tool_call(index: int, raw: Any) -> ToolCall:
 def parse_response(data: Any, latency_ms: float) -> Completion:
     """把 /chat/completions 的回应变成 Completion。结构不对时抛 ValueError。"""
     try:
-        message = data["choices"][0]["message"]
+        choice = data["choices"][0]
+        message = choice["message"]
+        finish = choice.get("finish_reason") or "stop"
         calls = tuple(_parse_tool_call(i, raw) for i, raw in enumerate(message.get("tool_calls") or ()))
         usage = data.get("usage") or {}
         return Completion(
@@ -102,6 +98,7 @@ def parse_response(data: Any, latency_ms: float) -> Completion:
             tokens_out=int(usage.get("completion_tokens") or 0),
             latency_ms=latency_ms,
             cached=False,
+            finish_reason="stop" if finish == "tool_calls" else str(finish),
         )
     except (KeyError, IndexError, TypeError, AttributeError) as exc:
         raise ValueError(f"缺少字段 {exc}") from exc
@@ -122,12 +119,7 @@ class OpenAIChatModel:
         self._cfg = cfg
         self._timeout_s = timeout_s
         self._url = cfg.base_url.rstrip("/") + "/chat/completions"
-        self._client = httpx.Client(
-            timeout=httpx.Timeout(timeout_s, connect=min(10.0, timeout_s)),
-            transport=transport,
-            # 环境里设了 http_proxy 时，发往本机服务的请求不能交给代理
-            trust_env=not is_loopback(cfg.base_url),
-        )
+        self._client = make_client(cfg.base_url, timeout_s, transport)
 
     def _headers(self) -> dict[str, str]:
         env = self._cfg.api_key_env
@@ -150,27 +142,16 @@ class OpenAIChatModel:
         payload = build_payload(
             self._cfg.model, messages, tools, temperature=temperature, max_tokens=max_tokens, seed=seed
         )
-        headers = self._headers()
-        start = time.perf_counter()
+        data, latency_ms = post_json(
+            self._client,
+            self._url,
+            payload,
+            name=self.name,
+            base_url=self._cfg.base_url,
+            timeout_s=self._timeout_s,
+            headers=self._headers(),
+        )
         try:
-            response = self._client.post(self._url, json=payload, headers=headers)
-        except httpx.TimeoutException as exc:
-            raise ModelError(
-                f"模型 {self.name} 超时（{self._timeout_s:g} 秒内没有回应）", retryable=True
-            ) from exc
-        except httpx.TransportError as exc:
-            raise ModelError(
-                f"连不上模型 {self.name} 的服务 {self._cfg.base_url}（{type(exc).__name__}）；本机服务请先启动",
-                retryable=True,
-            ) from exc
-        latency_ms = (time.perf_counter() - start) * 1000.0
-        if response.status_code != 200:
-            body = " ".join(response.text.split())[:_BODY_CHARS]
-            raise ModelError(
-                f"模型 {self.name} 的服务返回 {response.status_code}：{body}",
-                retryable=response.status_code >= 500 or response.status_code == 429,
-            )
-        try:
-            return parse_response(response.json(), latency_ms)
-        except ValueError as exc:  # 含 JSON 解析失败
+            return parse_response(data, latency_ms)
+        except ValueError as exc:
             raise ModelError(f"模型 {self.name} 的服务返回的内容不是预期的格式：{exc}") from exc

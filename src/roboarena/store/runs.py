@@ -151,12 +151,15 @@ def start_run(
 
 
 @contextmanager
-def resume_run(ws: Workspace, run_id: str) -> Iterator[Run]:
-    """接着一次没跑完的运行继续：沿用它的目录和记录，状态改回 running。"""
+def resume_run(ws: Workspace, run_id: str, *, allow_done: bool = False) -> Iterator[Run]:
+    """接着一次没跑完的运行继续：沿用它的目录和记录，状态改回 running。
+
+    已完成的运行默认不许重新打开；对话可以接着聊，所以它传 allow_done=True。
+    """
     row = ws.db.execute("SELECT kind, status FROM runs WHERE id = ?", (run_id,)).fetchone()
     if row is None:
         raise NotFoundError(f"没有编号为 {run_id} 的运行")
-    if row["status"] == "done":
+    if row["status"] == "done" and not allow_done:
         raise ConflictError(f"运行 {run_id} 已经完成，不需要续跑")
     run = Run(run_id, row["kind"], ws.root / "runs" / run_id, ws)
     ws.db.execute("UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (run_id,))

@@ -184,8 +184,12 @@ def test_errors_become_observations_not_exceptions(ctx):
 
 
 def test_list_policies(ctx):
-    names = [p["name"] for p in execute(ctx, "list_policies", {})["policies"]]
+    out = execute(ctx, "list_policies", {})
+    names = [p["name"] for p in out["policies"]]
     assert sorted(names) == sorted(fixture.POLICIES) and len(names) == 7
+    assert out["n_policies"] == 7  # 个数直接给出来：模型自己数出来的数没有出处
+    runs = execute(ctx, "list_runs", {"limit": 4})
+    assert runs["n_listed"] == 4 == len(runs["runs"])
 
 
 def test_leaderboard_matches_the_service(ctx):

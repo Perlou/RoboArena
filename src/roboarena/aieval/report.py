@@ -56,6 +56,9 @@ class Summary:
     latency_p95_ms: float | None
     tokens_in_mean: float
     tokens_out_mean: float
+    # 输出达到上限被截断的、被服务端中止的回应各有多少条（按用例 × 种子计）。早先的评测没记结束原因，为 None
+    n_length: int | None
+    n_aborted: int | None
 
 
 @dataclass(frozen=True)
@@ -110,7 +113,9 @@ def summarize(ws: Workspace, suite: str) -> list[Summary]:
             chosen = _in_bucket(rows, bucket)
             if not chosen:
                 continue
-            timed = [r["latency_ms"] for r in chosen if not json.loads(r["scores_json"])["cached"]]
+            scores = [json.loads(r["scores_json"]) for r in chosen]
+            timed = [r["latency_ms"] for r, sc in zip(chosen, scores, strict=True) if not sc["cached"]]
+            known = all("finish" in sc for sc in scores)
             out.append(
                 Summary(
                     suite_fp=fp,
@@ -126,6 +131,8 @@ def summarize(ws: Workspace, suite: str) -> list[Summary]:
                     latency_p95_ms=percentile(timed, 95) if timed else None,
                     tokens_in_mean=sum(r["tokens_in"] for r in chosen) / len(chosen),
                     tokens_out_mean=sum(r["tokens_out"] for r in chosen) / len(chosen),
+                    n_length=sum(sc["finish"] == "length" for sc in scores) if known else None,
+                    n_aborted=sum(sc["finish"] == "aborted" for sc in scores) if known else None,
                 )
             )
     return out
@@ -201,7 +208,8 @@ def render_report(ws: Workspace, suite: str) -> str:
         lines += [f"## 用例集 {fp[:12]}（{n_all} 条用例）", ""]
         lines += [
             "比例是各种子合并后的值（分母 = 用例数 × 种子数）。方括号里是 95% Wilson 区间，按用例数算："
-            "同一用例的几个种子不是独立样本。延迟不含命中缓存的调用。",
+            "同一用例的几个种子不是独立样本。延迟不含命中缓存的调用。"
+            "「截断 / 中止」是输出达到上限、被服务端中止的回应数（被中止的回应没有 token 数，平均值里按 0 算）。",
             "",
         ]
         rows = [
@@ -209,12 +217,13 @@ def render_report(ws: Workspace, suite: str) -> str:
                 s.model, s.setup, s.bucket, len(s.seeds), s.n_cases, _fmt_rate(s.valid), _fmt_rate(s.match),
                 f"{s.match.seed_spread:.3f}", f"{_ms(s.latency_p50_ms)} / {_ms(s.latency_p95_ms)}（{s.n_timed} 次）",
                 f"{s.tokens_in_mean:.0f} / {s.tokens_out_mean:.0f}",
+                "—" if s.n_length is None else f"{s.n_length} / {s.n_aborted}",
             )
             for s in mine
         ]  # fmt: skip
         lines += _md_table(
             ("模型", "配置", "桶", "种子数", "用例", "合法率", "完全匹配率", "种子间差（匹配）",
-             "延迟 p50 / p95 毫秒", "平均 token 入 / 出"),
+             "延迟 p50 / p95 毫秒", "平均 token 入 / 出", "截断 / 中止"),
             rows,
         )  # fmt: skip
         pairs = [c for c in comparisons if c.suite_fp == fp]

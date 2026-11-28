@@ -106,18 +106,33 @@ class EvalConfig:
 class LLMModelConfig:
     """一个语言模型的接入方式。密钥不写在这里：api_key_env 是存放密钥的环境变量的名字。"""
 
-    backend: str = "openai"  # 目前只有 openai：OpenAI 兼容的 HTTP 接口
-    base_url: str = "http://127.0.0.1:11434/v1"  # 本机 Ollama 的 OpenAI 兼容接口
+    # openai：OpenAI 兼容的 HTTP 接口，提示的渲染与输出的解析由服务端做；
+    # ollama：Ollama 的原样补全，渲染与解析由项目自己做（各模型看到的工具描述逐字相同）
+    backend: str = "openai"
+    base_url: str = "http://127.0.0.1:11434/v1"  # openai 后端带 /v1；ollama 后端是服务的根地址
     model: str = ""  # 推理服务里的模型标识
+    assistant_prefix: str = ""  # 只对 ollama 后端有效：接在助手开头之后的文字；带思考的模型写 "<think>\n"
+    num_ctx: int = (
+        0  # 只对 ollama 后端有效：上下文长度（token）；0 表示用服务的默认值。超出时服务端会截掉提示的开头
+    )
     api_key_env: str = ""  # 密钥所在的环境变量名；本机服务不需要
     price_in: float = 0.0  # 每百万输入 token 的价格
     price_out: float = 0.0  # 每百万输出 token 的价格
 
 
+OLLAMA_URL = "http://127.0.0.1:11434"  # 本机 Ollama 服务的根地址
+
+
 def _default_llm_models() -> dict[str, LLMModelConfig]:
     return {
-        "qwen7b": LLMModelConfig(model="qwen2.5:7b"),
-        "qwen08b": LLMModelConfig(model="qwen3.5:0.8b"),
+        "qwen7b": LLMModelConfig(backend="ollama", base_url=OLLAMA_URL, model="qwen2.5:7b", num_ctx=8192),
+        "qwen08b": LLMModelConfig(
+            backend="ollama",
+            base_url=OLLAMA_URL,
+            model="qwen3.5:0.8b",
+            assistant_prefix="<think>\n",
+            num_ctx=8192,
+        ),
     }
 
 
@@ -134,6 +149,22 @@ class LLMConfig:
 
 
 @dataclass
+class AgentConfig:
+    """Agent 的循环：各项上限、上下文预算、结果校验的开关。一轮对话超出任何一项上限就停下并如实说明。"""
+
+    max_steps: int = 8  # 一轮对话里最多调用几次模型
+    max_tool_calls: int = 12  # 一轮对话里最多执行几次工具调用
+    max_tokens: int = 60000  # 一轮对话里输入与输出 token 的总量上限
+    max_seconds: float = 300.0  # 一轮对话的时间上限（秒）；到点后不再发起新的模型调用
+    answer_tokens: int = 768  # 每次模型调用的输出上限
+    context_tokens: int = (
+        6000  # 上下文预算：上一次请求的输入超过它时，较早的工具输出换成一行摘要。应小于模型的上下文长度
+    )
+    observation_chars: int = 4000  # 单次工具输出给模型看的字符数上限；超出的部分省略（原文仍留在对话记录里）
+    verify: bool = True  # 结果校验：回答里的数字找不到出处时让模型重答一次。关掉用来测量它的作用
+
+
+@dataclass
 class Config:
     seed: int = 0
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
@@ -145,6 +176,7 @@ class Config:
     zoo: ZooConfig = field(default_factory=ZooConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    agent: AgentConfig = field(default_factory=AgentConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -156,7 +188,7 @@ class Config:
         return sha256_text(canonical_json(self.to_dict()))
 
 
-LLM_BACKENDS = ("openai",)
+LLM_BACKENDS = ("openai", "ollama")
 _NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 
@@ -205,6 +237,9 @@ def _apply_named(table: dict[str, Any], data: Any, item_type: type, key: str) ->
 
 def _validate(cfg: Config) -> None:
     """单个配置项的类型没问题之后，再查各项之间是否自洽。"""
+    for key, value in asdict(cfg.agent).items():
+        if not isinstance(value, bool) and value <= 0:
+            raise ConfigError(f"配置项 agent.{key} 应大于 0：{value}")
     llm = cfg.llm
     for key, name in (("default", llm.default), ("fallback", llm.fallback)):
         if name and name not in llm.models:
@@ -219,6 +254,8 @@ def _validate(cfg: Config) -> None:
     if llm.timeout_s <= 0:
         raise ConfigError(f"配置项 llm.timeout_s 应大于 0：{llm.timeout_s}")
     for name, model in llm.models.items():
+        if model.num_ctx < 0:
+            raise ConfigError(f"配置项 llm.models.{name}.num_ctx 不能是负数：{model.num_ctx}")
         if model.backend not in LLM_BACKENDS:
             raise ConfigError(
                 f"配置项 llm.models.{name}.backend 应为 {'、'.join(LLM_BACKENDS)} 之一，实际是 {model.backend!r}"
@@ -331,7 +368,8 @@ def _toml_value(value: Any) -> str:
     if isinstance(value, int | float):
         return repr(value)
     if isinstance(value, str):
-        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return '"' + escaped.replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r") + '"'
     if isinstance(value, list | tuple):
         return "[" + ", ".join(_toml_value(v) for v in value) + "]"
     raise ConfigError(f"无法写成 TOML 的值：{value!r}")
